@@ -21,7 +21,7 @@ PROFILE = "ga5-incident-agent/v2"
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite")
-LLM_FALLBACKS = [m.strip() for m in os.getenv("LLM_FALLBACKS", "gemini-3.1-flash-lite,gemini-3.8-flash,gemini-3.1-flash,gemini-flash-lite-latest,gemini-flash-latest").split(",") if m.strip()]
+LLM_FALLBACKS = [m.strip() for m in os.getenv("LLM_FALLBACKS", "gemini-3.1-flash-lite,gemini-3.5-flash-lite,gemini-flash-lite-latest,gemini-3.5-flash,gemini-3.6-flash,gemini-3.7-flash,gemini-3.8-flash,gemini-flash-latest").split(",") if m.strip()]
 DB_PATH = os.getenv("DB_PATH", "incidents.db")
 DEBUG_ENDPOINTS = os.getenv("DEBUG_ENDPOINTS", "1") != "0"
 
@@ -113,6 +113,7 @@ def clean_args(schema, args):
     return args
 
 
+COOLDOWN = {}  # (base, model) -> monotonic time until which a rate-limited model is skipped
 DEAD_MODELS = set()          # (base, model) pairs that answered 404 -> skip for the rest of the process
 ERRORS = collections.deque(maxlen=60)  # recent planner failures: status codes / types only, never inputs
 
@@ -179,7 +180,10 @@ async def plan_with_llm(b):
     last = None
     async with httpx.AsyncClient() as c:
         for rnd in range(4):
-            live = [(bs, k, m) for bs, k, m in chain if (bs, m) not in DEAD_MODELS]
+            now = time.monotonic()
+            live = [(bs, k, m) for bs, k, m in chain if (bs, m) not in DEAD_MODELS and COOLDOWN.get((bs, m), 0) <= now]
+            if not live:  # everything cooling down: try them all anyway
+                live = [(bs, k, m) for bs, k, m in chain if (bs, m) not in DEAD_MODELS]
             if not live:
                 raise last or RuntimeError("no usable model")
             for base, key, model in live:
@@ -225,6 +229,8 @@ async def plan_with_llm(b):
                         continue
                 if r.status_code == 404:
                     DEAD_MODELS.add((base, model))
+                if r.status_code == 429:
+                    COOLDOWN[(base, model)] = time.monotonic() + 30
                 log.error("LLM HTTP %s model=%s body=%s", r.status_code, model, r.text[:200])
                 note(f"http_{r.status_code}", model, r.text[:140])
                 last = RuntimeError(f"llm http {r.status_code}")
