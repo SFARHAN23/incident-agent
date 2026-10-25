@@ -8,7 +8,9 @@ Layers (kept separate on purpose):
   3. TRACE         build_otlp()                -> pure function of stored state
   4. API           FastAPI routes + SQLite storage
 """
-import os, json, re, time, secrets, hashlib, asyncio, sqlite3
+import os, json, re, time, secrets, hashlib, asyncio, sqlite3, logging, traceback
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("incident")
 from collections import defaultdict
 
 import httpx
@@ -75,7 +77,7 @@ def err(code, msg="request rejected"):
     return JSONResponse({"error": msg}, status_code=code)  # never echo input
 
 
-EV_RE = re.compile(r"^\s*\[([^\]\s]+)\]", re.M)
+EV_RE = re.compile(r"\[(ev_[^\]\s]+)\]")
 
 
 # ================================================================ 1. PLANNER
@@ -132,22 +134,29 @@ Reply with ONLY this JSON:
 {{"rootCause":"...","evidence":["ev_.."],
  "diagnostics":[{{"toolName":"...","arguments":{{}},"evidence":["ev_.."]}}],
  "effect":{{"toolName":"...","arguments":{{}}}}}}"""
-    async with httpx.AsyncClient(timeout=14) as c:
-        r = await c.post(
-            f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-            json={
-                "model": LLM_MODEL,
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": "You are an incident triage planner. Output JSON only."},
-                    {"role": "user", "content": prompt},
-                ],
-            },
-        )
-    r.raise_for_status()
+    payload = {
+        "model": LLM_MODEL,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": "You are an incident triage planner. Output JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
+    hdr = {"Authorization": f"Bearer {LLM_API_KEY}"}
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.post(url, headers=hdr, json=payload)
+        if r.status_code == 400:  # some models reject json mode; retry once without it
+            payload.pop("response_format")
+            r = await c.post(url, headers=hdr, json=payload)
+    if r.status_code != 200:
+        log.error("LLM HTTP %s model=%s body=%s", r.status_code, LLM_MODEL, r.text[:500])
+        r.raise_for_status()
     txt = r.json()["choices"][0]["message"]["content"]
+    if isinstance(txt, list):
+        txt = "".join(p.get("text", "") for p in txt if isinstance(p, dict))
+    log.info("LLM raw answer: %s", txt[:1500])
     return json.loads(re.search(r"\{.*\}", txt, re.S).group(0))
 
 
@@ -169,10 +178,13 @@ def build_plan(raw, b):
     maxd = min(3, int(pol.get("maximumDiagnostics", 3) or 3))
     diags, seen = [], set()
     for d in raw["diagnostics"]:
-        name = d["toolName"]
+        name = d.get("toolName")
         if name not in cat or name in eff_names:
-            raise ValueError("diag tool")
-        args = clean_args(cat[name].get("inputSchema"), d.get("arguments"))
+            continue  # skip a bad diagnostic instead of failing the whole plan
+        try:
+            args = clean_args(cat[name].get("inputSchema"), d.get("arguments"))
+        except ValueError:
+            continue
         key = (name, canon(args))
         if key in seen:
             continue
@@ -507,6 +519,7 @@ async def start(request: Request):
         try:
             plan = build_plan(await call_llm(b), b)
         except Exception:
+            log.error("planner failed:\n%s", traceback.format_exc())
             return err(502, "planner failed")
         m_end = time.time_ns()
 
