@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 PROFILE = "ga5-incident-agent/v2"
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite")
 DB_PATH = os.getenv("DB_PATH", "incidents.db")
 
 # ---------------------------------------------------------------- storage
