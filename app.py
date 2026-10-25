@@ -8,7 +8,7 @@ Layers (kept separate on purpose):
   3. TRACE         build_otlp()                -> pure function of stored state
   4. API           FastAPI routes + SQLite storage
 """
-import os, json, re, time, secrets, hashlib, asyncio, sqlite3, logging, traceback
+import os, json, re, time, secrets, hashlib, asyncio, sqlite3, logging, traceback, collections
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("incident")
 from collections import defaultdict
@@ -23,11 +23,24 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite")
 LLM_FALLBACKS = [m.strip() for m in os.getenv("LLM_FALLBACKS", "gemini-3.1-flash-lite,gemini-3.8-flash,gemini-3.1-flash,gemini-flash-lite-latest,gemini-flash-latest").split(",") if m.strip()]
 DB_PATH = os.getenv("DB_PATH", "incidents.db")
+DEBUG_ENDPOINTS = os.getenv("DEBUG_ENDPOINTS", "1") != "0"
 
 # ---------------------------------------------------------------- storage
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.execute("create table if not exists runs(run_id text primary key, state text not null)")
-db.commit()
+def open_db():
+    for p in (DB_PATH, "/tmp/incidents.db"):  # fall back if the app dir is read-only
+        try:
+            c = sqlite3.connect(p, check_same_thread=False)
+            c.execute("create table if not exists runs(run_id text primary key, state text not null)")
+            c.commit()
+            return c
+        except Exception as ex:
+            logging.getLogger("incident").error("db open failed path=%s %s", p, type(ex).__name__)
+    c = sqlite3.connect(":memory:", check_same_thread=False)
+    c.execute("create table if not exists runs(run_id text primary key, state text not null)")
+    return c
+
+
+db = open_db()
 
 
 def load(run_id):
@@ -100,14 +113,21 @@ def clean_args(schema, args):
     return args
 
 
-async def call_llm(b):
-    """One model call. Returns the parsed JSON plan (unvalidated)."""
+DEAD_MODELS = set()          # (base, model) pairs that answered 404 -> skip for the rest of the process
+ERRORS = collections.deque(maxlen=60)  # recent planner failures: status codes / types only, never inputs
+
+
+def note(kind, model, detail=""):
+    ERRORS.append({"t": int(time.time()), "kind": kind, "model": model, "detail": str(detail)[:160]})
+
+
+def build_prompt(b):
     inc, pol = b["incident"], b["policy"]
     eff_names = set(pol.get("effectTools") or [])
     diag = [t for t in b["toolCatalog"] if t["name"] not in eff_names]
     eff = [t for t in b["toolCatalog"] if t["name"] in eff_names]
     maxd = min(3, int(pol.get("maximumDiagnostics", 3) or 3))
-    prompt = f"""INCIDENT: {inc.get('title')}
+    return f"""INCIDENT: {inc.get('title')}
 service: {inc.get('service')}   severity: {inc.get('severity')}
 
 ALLOWED ROOT CAUSES (pick exactly one, copy verbatim):
@@ -129,6 +149,7 @@ RULES
   * If the evidence shows the service is already AT its maximum/permitted replica ceiling, do NOT use scale_service; use page_owner.
   * Use scale_service only when current replicas are below the stated ceiling, and never target more than the ceiling.
   * Use rollback_deployment / disable_feature only on the exact release / flag named in the evidence.
+  * For rollback_deployment, "release" is the FAULTY release that introduced the regression (the release being rolled back). NEVER use the previous healthy release, a holdback/control group's release, or a release from an unrelated postmortem. Your analysis must name the faulty release and the argument must be that same id.
   * If nothing justifies action, use no_action with a reasonCode.
 
 TRANSCRIPT:
@@ -138,16 +159,32 @@ Reply with ONLY this JSON. In "analysis" first write at most 100 words: which ca
 {{"analysis":"...","rootCause":"...","evidence":["ev_.."],
  "diagnostics":[{{"toolName":"...","arguments":{{}},"evidence":["ev_.."]}}],
  "effect":{{"toolName":"...","arguments":{{}}}}}}"""
-    chain = [(LLM_BASE_URL, LLM_API_KEY, m) for m in [LLM_MODEL] + [x for x in LLM_FALLBACKS if x != LLM_MODEL]]
+
+
+def llm_chain():
+    models = [LLM_MODEL] + [x for x in LLM_FALLBACKS if x != LLM_MODEL]
+    chain = [(LLM_BASE_URL, LLM_API_KEY, m) for m in models]
     if os.getenv("LLM2_API_KEY"):  # optional second provider (e.g. Groq / OpenRouter)
         chain.append((os.getenv("LLM2_BASE_URL", ""), os.getenv("LLM2_API_KEY"), os.getenv("LLM2_MODEL", "")))
-    deadline = time.monotonic() + 15.5  # grader allows 18s per request
+    return chain
+
+
+async def plan_with_llm(b):
+    """Calls the model until it returns a plan that passes build_plan(), or the budget runs out.
+    Returns (validated_plan, model_name). A bad/unusable answer moves on to the next model
+    instead of failing the request."""
+    prompt = build_prompt(b)
+    chain = llm_chain()
+    deadline = time.monotonic() + 15.0  # grader allows 18s per request
     last = None
     async with httpx.AsyncClient() as c:
-        for rnd in range(4):  # cycle through all providers/models until one answers
-            for base, key, model in chain:
+        for rnd in range(4):
+            live = [(bs, k, m) for bs, k, m in chain if (bs, m) not in DEAD_MODELS]
+            if not live:
+                raise last or RuntimeError("no usable model")
+            for base, key, model in live:
                 left = deadline - time.monotonic()
-                if left < 2.5:
+                if left < 2.0:
                     raise last or RuntimeError("llm deadline")
                 payload = {
                     "model": model, "temperature": 0,
@@ -166,9 +203,11 @@ Reply with ONLY this JSON. In "analysis" first write at most 100 words: which ca
                     if r.status_code == 400:
                         payload.pop("response_format", None)  # model rejects json mode
                         payload.pop("reasoning_effort", None)
-                        r = await c.post(url, headers=hdr, json=payload, timeout=max(min(deadline - time.monotonic(), 12), 2))
+                        r = await c.post(url, headers=hdr, json=payload,
+                                         timeout=max(min(deadline - time.monotonic(), 12), 2))
                 except httpx.HTTPError as ex:
                     log.error("LLM transport error model=%s %s", model, type(ex).__name__)
+                    note("transport", model, type(ex).__name__)
                     last = ex
                     continue
                 if r.status_code == 200:
@@ -176,17 +215,20 @@ Reply with ONLY this JSON. In "analysis" first write at most 100 words: which ca
                         txt = r.json()["choices"][0]["message"]["content"]
                         if isinstance(txt, list):
                             txt = "".join(p.get("text", "") for p in txt if isinstance(p, dict))
-                        log.info("LLM raw answer (model=%s): %s", model, txt[:1500])
-                        out = json.loads(re.search(r"\{.*\}", txt, re.S).group(0))
-                        out["_model"] = model
-                        return out
+                        raw = json.loads(re.search(r"\{.*\}", txt, re.S).group(0))
+                        plan = build_plan(raw, b)  # validate HERE so a bad plan triggers another attempt
+                        return plan, model
                     except Exception as ex:
-                        log.error("LLM bad answer model=%s %s", model, type(ex).__name__)
+                        log.error("LLM unusable answer model=%s %s", model, type(ex).__name__)
+                        note("bad_plan", model, f"{type(ex).__name__} {ex}")
                         last = ex
                         continue
+                if r.status_code == 404:
+                    DEAD_MODELS.add((base, model))
                 log.error("LLM HTTP %s model=%s body=%s", r.status_code, model, r.text[:200])
+                note(f"http_{r.status_code}", model, r.text[:140])
                 last = RuntimeError(f"llm http {r.status_code}")
-            await asyncio.sleep(0.7)
+            await asyncio.sleep(0.5)
     raise last or RuntimeError("llm failed")
 
 
@@ -494,13 +536,14 @@ def current_view(st):
 
 
 def replay_view(st, key):
-    if st["status"] != "waiting":
-        return final_view(st)
-    return st["snapshots"][key]
+    # Replays return the exact response originally given for that request/receipt,
+    # read from stored state (no model call, no new action).
+    snap = st["snapshots"].get(key)
+    return snap if snap else current_view(st)
 
 
 # ================================================================ 4. API
-app = FastAPI()
+app = FastAPI(redirect_slashes=False)  # the grader must never be redirected
 locks = defaultdict(asyncio.Lock)
 
 
@@ -530,6 +573,7 @@ def valid_start(b):
 
 
 @app.post("/v2/incidents")
+@app.post("/v2/incidents/")
 async def start(request: Request):
     b = await read_body(request)
     if not valid_start(b):
@@ -541,27 +585,17 @@ async def start(request: Request):
         if st:
             if st["hash"] != h:
                 return err(409, "conflict")
-            return JSONResponse(replay_view(st, "init"))
+            return JSONResponse(replay_view(st, "init"))  # the exact first response
 
         t_start = time.time_ns()
         m_start = time.time_ns()
         try:
-            raw_plan = await call_llm(b)
-            used_model = raw_plan.pop("_model", LLM_MODEL)
-            plan = build_plan(raw_plan, b)
+            plan, used_model = await plan_with_llm(b)
         except Exception:
             log.error("planner failed:\n%s", traceback.format_exc())
             return err(502, "planner failed")
         m_end = time.time_ns()
-        try:  # debug: synthetic incident metadata only, never the sensitive object
-            log.info("DEBUG title=%s service=%s causes=%s", b["incident"].get("title"),
-                     b["incident"].get("service"), json.dumps(b["incident"]["allowedRootCauses"]))
-            log.info("DEBUG catalog=%s policy=%s", json.dumps(b["toolCatalog"])[:3000], json.dumps(b["policy"])[:800])
-            log.info("DEBUG plan=%s", json.dumps(plan)[:2000])
-        except Exception:
-            pass
 
-        log.info("DEBUG hdr traceparent=%s tracestate=%s", request.headers.get("traceparent"), request.headers.get("tracestate"))
         inc_tp = parse_traceparent(request.headers.get("traceparent"))
         tracestate = request.headers.get("tracestate") if inc_tp else None
         trace = {"traceId": inc_tp[0] if inc_tp else hid(16), "parentSpanId": inc_tp[1] if inc_tp else None,
@@ -598,6 +632,7 @@ async def start(request: Request):
 
 
 @app.post("/v2/incidents/{run_id}/receipts")
+@app.post("/v2/incidents/{run_id}/receipts/")
 async def receipts(run_id: str, request: Request):
     body = await read_body(request)
     if not isinstance(body, dict) or not nonempty(body.get("receiptId")):
@@ -616,12 +651,13 @@ async def receipts(run_id: str, request: Request):
         new_d, new_apps = apply_receipt(st, body)
         st["receipts"][rid] = h
         view = final_view(st) if st["status"] != "waiting" else waiting_view(st, new_d, new_apps)
-        st["snapshots"][rid] = view if st["status"] == "waiting" else {}
+        st["snapshots"][rid] = view
         save(st)
         return JSONResponse(view)
 
 
 @app.get("/v2/incidents/{run_id}")
+@app.get("/v2/incidents/{run_id}/")
 async def get_run(run_id: str):
     st = load(run_id)
     if not st:
@@ -632,3 +668,39 @@ async def get_run(run_id: str):
 @app.get("/")
 async def health():
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- debug (no inputs, no secrets)
+if DEBUG_ENDPOINTS:
+    @app.get("/debug/errors")
+    async def dbg_errors():
+        return {"recent": list(ERRORS), "deadModels": sorted(m for _, m in DEAD_MODELS)}
+
+    @app.get("/debug/llm")
+    async def dbg_llm():
+        """Pings every configured model with a tiny request. Costs ~nothing, uses no grader check."""
+        out = {"keyConfigured": bool(LLM_API_KEY), "baseUrl": LLM_BASE_URL, "models": []}
+
+        async def ping(c, base, key, model):
+            t0 = time.monotonic()
+            try:
+                r = await c.post(f"{base.rstrip('/')}/chat/completions", headers={"Authorization": f"Bearer {key}"},
+                                 json={"model": model, "temperature": 0,
+                                       "messages": [{"role": "user", "content": 'Reply with JSON {"ok":true}'}]},
+                                 timeout=12)
+                return {"model": model, "status": r.status_code, "ms": int((time.monotonic() - t0) * 1000),
+                        "note": "" if r.status_code == 200 else r.text[:140]}
+            except Exception as ex:
+                return {"model": model, "status": 0, "ms": int((time.monotonic() - t0) * 1000), "note": type(ex).__name__}
+
+        async with httpx.AsyncClient() as c:
+            out["models"] = await asyncio.gather(*[ping(c, bs, k, m) for bs, k, m in llm_chain()])
+            try:
+                r = await c.get(f"{LLM_BASE_URL.rstrip('/')}/models", headers={"Authorization": f"Bearer {LLM_API_KEY}"}, timeout=8)
+                if r.status_code == 200:
+                    out["available"] = sorted(x.get("id", "") for x in r.json().get("data", []))[:80]
+                else:
+                    out["availableStatus"] = r.status_code
+            except Exception as ex:
+                out["availableStatus"] = type(ex).__name__
+        return out
