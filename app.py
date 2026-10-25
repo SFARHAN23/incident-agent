@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 PROFILE = "ga5-incident-agent/v2"
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.1-flash-lite")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.8-flash")
 DB_PATH = os.getenv("DB_PATH", "incidents.db")
 
 # ---------------------------------------------------------------- storage
@@ -522,6 +522,13 @@ async def start(request: Request):
             log.error("planner failed:\n%s", traceback.format_exc())
             return err(502, "planner failed")
         m_end = time.time_ns()
+        try:  # debug: synthetic incident metadata only, never the sensitive object
+            log.info("DEBUG title=%s service=%s causes=%s", b["incident"].get("title"),
+                     b["incident"].get("service"), json.dumps(b["incident"]["allowedRootCauses"]))
+            log.info("DEBUG catalog=%s policy=%s", json.dumps(b["toolCatalog"])[:3000], json.dumps(b["policy"])[:800])
+            log.info("DEBUG plan=%s", json.dumps(plan)[:2000])
+        except Exception:
+            pass
 
         inc_tp = parse_traceparent(request.headers.get("traceparent"))
         tracestate = request.headers.get("tracestate") if inc_tp else None
