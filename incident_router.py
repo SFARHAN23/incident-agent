@@ -19,7 +19,6 @@ def diagnose_incident(data: dict):
 
     diagnostics = ["check_metrics", "check_scaling_quota"]
 
-    # RULE: When service is already at permitted scaling limit, page owner instead of scaling!
     if current_replicas >= max_replicas and (cpu > 80.0 or err_rate > 0.05):
         root_cause = f"High saturation (CPU {cpu}%) but service reached max limit ({current_replicas}/{max_replicas})."
         action = "PAGE_OWNER"
@@ -59,7 +58,6 @@ def diagnose_incident(data: dict):
         "telemetry": telemetry
     }
 
-@router.post("")
 @router.post("/")
 @router.post("/triage")
 @router.post("/diagnose")
