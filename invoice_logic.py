@@ -29,7 +29,7 @@ def extract_package_decision(pkg: dict) -> dict:
         amt_str = total_m.group(2).replace(",", "")
         amount_minor = int(round(float(amt_str) * 100))
     else:
-        minor_m = re.search(r"amountMinor["\':\s]+(\d+)", full_text)
+        minor_m = re.search(r"amountMinor[^\d]+(\d+)", full_text)
         amount_minor = int(minor_m.group(1)) if minor_m else 100000
         currency = "USD"
 
