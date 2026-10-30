@@ -14,7 +14,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Root Keep-Alive / Health Check
 @app.get("/")
 @app.get("/healthz")
 def health(request: Request):
@@ -25,26 +24,27 @@ def health(request: Request):
         "endpoints": {
             "task2_a2a_base": f"https://{host}/a2a/",
             "task3_mailroom": f"https://{host}/mailroom/propose",
-            "task4_incident": f"https://{host}/incident/triage"
+            "task4_incident": f"https://{host}/incident/v2/incidents"
         }
     }
 
-# Task 2: A2A Agent Card Spec (required by A2A protocol)
 @app.get("/.well-known/agent-card.json")
 def agent_card(request: Request):
     host = request.headers.get("x-forwarded-host") or request.headers.get("host", "localhost")
     base = f"https://{host}/a2a/"
     return JSONResponse({
-        "name": "A2A Invoice Agent",
-        "description": "Evidence-based invoice agent handling decisions and safe recovery.",
+        "name": "Invoice Action Agent",
+        "description": "Reads invoice packages and proposes one safe action per invoice with cited evidence.",
         "version": "1.0.0",
+        "capabilities": {"streaming": False, "pushNotifications": False},
         "supportedInterfaces": [{"url": base, "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}],
         "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
         "defaultOutputModes": ["application/vnd.ga5.invoice-action-proposals+json", "application/vnd.ga5.invoice-action-receipts+json"],
         "skills": [{
             "id": "invoice_action_agent",
-            "name": "Invoice Action Agent",
-            "description": "Proposes settle, approve, hold, duplicate rejection, or exception."
+            "name": "Invoice action agent",
+            "description": "Decides settle, approve, hold, reject-duplicate or exception for each invoice package.",
+            "tags": ["invoice", "payments", "approval"]
         }]
     })
 
@@ -52,15 +52,13 @@ def agent_card(request: Request):
 app.include_router(a2a_router.router, prefix="/a2a", tags=["Task 2: Invoice Agent"])
 app.include_router(mailroom_router.router, prefix="/mailroom", tags=["Task 3: Safe Mailroom"])
 app.include_router(incident_router.router, prefix="/incident", tags=["Task 4: Incident Triage"])
+# Mount incident router at root for direct /v2/incidents requests
+app.include_router(incident_router.router, tags=["Task 4: Direct v2 Aliases"])
 
-# Aliases if grader calls root directly
+# Root aliases for mailroom
 @app.post("/propose")
 async def root_propose(request: Request):
     return await mailroom_router.propose_route(request)
-
-@app.post("/triage")
-async def root_triage(request: Request):
-    return await incident_router.incident_route(request)
 
 if __name__ == "__main__":
     import uvicorn
