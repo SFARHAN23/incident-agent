@@ -17,7 +17,6 @@ def evaluate_case(case: dict):
     auth_status = str(auth.get("status", "ACTIVE")).upper()
     has_sig = bool(auth.get("signature") or auth.get("signed"))
 
-    # Security check: Check Authority Scope & Recipient Match
     if not has_sig:
         permitted = False
         decision_action = "REJECT"
@@ -51,7 +50,6 @@ def evaluate_case(case: dict):
         "proposalId": "prop-" + sha(case_id)[:16]
     }
 
-@router.post("")
 @router.post("/")
 @router.post("/propose")
 @router.post("/evaluate")
@@ -59,7 +57,6 @@ async def propose_route(request: Request):
     try: body = await request.json()
     except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
-    # Support single-case object or batch envelope
     if "cases" in body and isinstance(body["cases"], list):
         proposals = [evaluate_case(c) for c in body["cases"]]
         return JSONResponse({"status": "PROPOSED", "proposals": proposals, "batchId": body.get("batchId", "batch_1")})
