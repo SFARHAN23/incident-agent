@@ -50,7 +50,10 @@ def evaluate_case(case: dict):
         "proposalId": "prop-" + sha(case_id)[:16]
     }
 
-@router.post("/")
+@router.post("/mailroom/propose")
+@router.post("/mailroom/evaluate")
+@router.post("/mailroom")
+@router.post("/mailroom/")
 @router.post("/propose")
 @router.post("/evaluate")
 async def propose_route(request: Request):
@@ -67,6 +70,9 @@ async def propose_route(request: Request):
         prop = evaluate_case(body)
         return JSONResponse({"status": "PROPOSED", "proposal": prop, "proposals": [prop], **prop})
 
+@router.post("/mailroom/execute")
+@router.post("/mailroom/receipt")
+@router.post("/mailroom/confirm-receipt")
 @router.post("/execute")
 @router.post("/receipt")
 @router.post("/confirm-receipt")
