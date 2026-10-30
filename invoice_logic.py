@@ -26,7 +26,7 @@ def extract_package_decision(pkg: dict) -> dict:
         po_m = re.search(r"\b(PO-[0-9]+)\b", all_text)
         invoice_no = po_m.group(1).strip() if po_m else "N/A"
 
-    # Stated total with robust cleaning of commas and trailing period
+    # Stated total with robust regex cleaning of commas and trailing periods
     total_m = re.search(r"(?:stated total|signed for|disbursement for)\s+([A-Z]{3})\s*([0-9,.]+)", all_text)
     if total_m:
         currency = total_m.group(1)
