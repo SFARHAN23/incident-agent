@@ -8,7 +8,7 @@ router = APIRouter()
 
 LLM_URL = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
 LLM_KEY = os.environ.get("LLM_KEY", os.environ.get("GEMINI_API_KEY", "")).strip()
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.8-flash")
 
 def sha(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
