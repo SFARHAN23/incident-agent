@@ -15,7 +15,6 @@ def strings(x):
 def extract_package_decision(pkg: dict) -> dict:
     all_text = "\n\n".join(strings(pkg))
 
-    # 1. Commercial Identifiers
     vendor_m = re.search(r"(?:Supplier|to)\s+([^;\n\r]+)", all_text)
     vendor = vendor_m.group(1).strip().rstrip(";,.") if vendor_m else "Unknown Vendor"
 
@@ -26,7 +25,6 @@ def extract_package_decision(pkg: dict) -> dict:
         po_m = re.search(r"\b(PO-[0-9]+)\b", all_text)
         invoice_no = po_m.group(1).strip() if po_m else "N/A"
 
-    # Stated total with robust regex cleaning of commas and trailing periods
     total_m = re.search(r"(?:stated total|signed for|disbursement for)\s+([A-Z]{3})\s*([0-9,.]+)", all_text)
     if total_m:
         currency = total_m.group(1)
@@ -44,7 +42,6 @@ def extract_package_decision(pkg: dict) -> dict:
         amount_minor = int(minor_m.group(1)) if minor_m else 100000
         currency = "USD"
 
-    # 2. Extract Evidence References
     paragraphs = [p.strip() for p in all_text.split("\n\n") if p.strip()]
     deciding_p = ""
     evidence_refs = []
@@ -68,7 +65,6 @@ def extract_package_decision(pkg: dict) -> dict:
             all_refs = list(dict.fromkeys(re.findall(r"\[R_[A-Za-z0-9_\-]+\]", all_text)))
             evidence_refs = all_refs[:3] if len(all_refs) >= 3 else (all_refs + ["[R_REF1]", "[R_REF2]", "[R_REF3]"])[:3]
 
-    # 3. Decision Logic
     lp = (deciding_p or all_text).lower()
     if any(k in lp for k in ["earlier posting", "earlier settled", "duplicate", "already paid", "already settled", "prohibits a second disbursement", "rejection, not a second settlement", "previously settled"]):
         action = "reject_duplicate"
