@@ -193,8 +193,9 @@ def analyze_transcript(transcript: str, allowed_roots: list):
     return best_root, chosen_evs[:4]
 
 @router.post("/v2/incidents")
-@router.post("")
-@router.post("/")
+@router.post("/incident/v2/incidents")
+@router.post("/incident")
+@router.post("/incident/")
 async def create_incident(request: Request):
     try: body = await request.json()
     except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
@@ -281,7 +282,8 @@ async def create_incident(request: Request):
     return JSONResponse(response_payload)
 
 @router.post("/v2/incidents/{runId}/receipts")
-@router.post("/{runId}/receipts")
+@router.post("/incident/v2/incidents/{runId}/receipts")
+@router.post("/incident/{runId}/receipts")
 async def handle_receipts(runId: str, request: Request):
     try: body = await request.json()
     except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
@@ -488,7 +490,8 @@ async def handle_receipts(runId: str, request: Request):
     return JSONResponse(resp)
 
 @router.get("/v2/incidents/{runId}")
-@router.get("/{runId}")
+@router.get("/incident/v2/incidents/{runId}")
+@router.get("/incident/{runId}")
 def get_incident(runId: str):
     run_row = q("SELECT state_json FROM incident_runs WHERE run_id=?", (runId,))
     if not run_row: return JSONResponse({"error": "Not found"}, status_code=404)
