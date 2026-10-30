@@ -2,14 +2,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 import json, hashlib, uuid, time, re, os
 import httpx
-from dotenv import load_dotenv
 from database import q, tx
 
-load_dotenv()
 router = APIRouter()
 
 LLM_URL = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
-LLM_KEY = os.environ.get("LLM_KEY") or os.environ.get("GEMINI_API_KEY", "")
+LLM_KEY = os.environ.get("LLM_KEY", os.environ.get("GEMINI_API_KEY", "")).strip()
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
 
 def sha(s: str) -> str:
@@ -22,10 +20,10 @@ def nano(offset_ms=0) -> str:
     return str(int((time.time() * 1000 + offset_ms) * 1e6))
 
 # ---------------------------------------------------------------------------
-# Planner: Uses LLM with fallback heuristic for exact incident-specific args
+# Preprocessor & Planner: Fast, schema-aligned case argument extraction
 # ---------------------------------------------------------------------------
 
-def extract_evidence_candidates(transcript: str):
+def extract_evidence_lines(transcript: str):
     lines = [line.strip() for line in transcript.split("\n") if line.strip()]
     candidates = []
     for l in lines:
@@ -33,31 +31,30 @@ def extract_evidence_candidates(transcript: str):
         if m:
             ev_id = m.group(1)
             content = m.group(2)
-            # Skip customer text or training examples per specification
-            if not any(w in content.lower() for w in ["training example", "quoted", "customer note"]):
+            if not any(w in content.lower() for w in ["training example", "customer said", "quoted", "customer note"]):
                 candidates.append((ev_id, content))
     return candidates
 
-def plan_with_ai(incident_data: dict, tool_catalog: list, policy: dict):
+def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
     transcript = incident_data.get("transcript", "")
     allowed_roots = incident_data.get("allowedRootCauses", [])
     service = incident_data.get("service", "target-service")
     effect_tools = set(policy.get("effectTools", []))
     diag_tools = [t for t in tool_catalog if t.get("name") not in effect_tools]
-    max_diag = policy.get("maximumDiagnostics", 2)
+    max_diag = policy.get("maximumDiagnostics", 3)
 
-    ev_candidates = extract_evidence_candidates(transcript)
+    ev_lines = extract_evidence_lines(transcript)
 
-    # 1. Attempt LLM Planning if key is available
+    # 1. Fast LLM Planner when LLM_KEY is provided via Render Environment
     if LLM_KEY:
         try:
-            catalog_summary = [{"name": t.get("name"), "description": t.get("description"), "schema": t.get("inputSchema")} for t in diag_tools]
-            prompt = {
+            compact_evidence = [{"id": cid, "text": ctxt[:120]} for cid, ctxt in ev_lines[:25]]
+            prompt_data = {
                 "service": service,
-                "title": incident_data.get("title"),
+                "title": incident_data.get("title", ""),
                 "allowedRootCauses": allowed_roots,
-                "availableDiagnosticTools": catalog_summary,
-                "evidenceLines": [{"id": cid, "text": ctxt} for cid, ctxt in ev_candidates[:30]]
+                "availableDiagnostics": [{"name": t.get("name"), "description": t.get("description"), "inputSchema": t.get("inputSchema")} for t in diag_tools],
+                "evidenceLines": compact_evidence
             }
             body = {
                 "model": LLM_MODEL,
@@ -67,67 +64,67 @@ def plan_with_ai(incident_data: dict, tool_catalog: list, policy: dict):
                     {
                         "role": "system",
                         "content": (
-                            "You are an SRE incident agent. From the evidence lines, choose EXACTLY ONE root cause from "
-                            "`allowedRootCauses`, cite 2 to 4 evidence IDs (just the ID, no brackets), and select 1 or 2 "
-                            "strictly necessary diagnostic tools with exact case arguments adhering to their schemas. "
-                            "Format: {\"rootCause\":\"...\", \"evidence\":[\"...\"], \"diagnostics\":[{\"toolName\":\"...\", \"arguments\":{...}, \"evidence\":[\"...\"]}]}"
+                            "You are an SRE incident agent. From the evidence lines, choose EXACTLY ONE root cause from `allowedRootCauses`, "
+                            "cite between 2 and 4 evidence IDs from `evidenceLines`, and select 1 to 2 strictly necessary diagnostic tools "
+                            "with exact case-derived arguments from the evidence text adhering to their inputSchema.\n"
+                            "Return JSON:\n"
+                            "{\"rootCause\":\"...\", \"evidence\":[\"...\"], \"diagnostics\":[{\"toolName\":\"...\", \"arguments\":{...}}]}"
                         )
                     },
-                    {"role": "user", "content": json.dumps(prompt)}
+                    {"role": "user", "content": json.dumps(prompt_data)}
                 ]
             }
-            res = httpx.post(LLM_URL, json=body, headers={"Authorization": f"Bearer {LLM_KEY}"}, timeout=8.0)
+            res = httpx.post(LLM_URL, json=body, headers={"Authorization": f"Bearer {LLM_KEY}"}, timeout=12.0)
             if res.status_code == 200:
-                out = json.loads(res.json()["choices"][0]["message"]["content"])
-                if out.get("rootCause") in allowed_roots and len(out.get("evidence", [])) >= 2:
-                    return out["rootCause"], out["evidence"][:4], out.get("diagnostics", [])[:max_diag]
+                parsed = json.loads(res.json()["choices"][0]["message"]["content"])
+                rc = parsed.get("rootCause")
+                ev = parsed.get("evidence", [])
+                diag = parsed.get("diagnostics", [])
+                if rc in allowed_roots and len(ev) >= 2 and diag:
+                    return rc, ev[:4], diag[:max_diag]
         except Exception:
             pass
 
-    # 2. Deterministic High-Precision Heuristic Fallback
+    # 2. High-Precision Heuristic Fallback
     best_root = allowed_roots[0] if allowed_roots else "unknown_issue"
     best_score = -1
     matched_evs = []
 
     for root in allowed_roots:
         tokens = [t for t in re.split(r"[_\s\-]+", root.lower()) if len(t) > 2]
-        cur_evs = [cid for cid, ctxt in ev_candidates if any(tok in ctxt.lower() for tok in tokens)]
+        cur_evs = [cid for cid, ctxt in ev_lines if any(tok in ctxt.lower() for tok in tokens)]
         if len(cur_evs) > best_score:
             best_score = len(cur_evs)
             best_root = root
             matched_evs = cur_evs
 
     if len(matched_evs) < 2:
-        all_ids = [cid for cid, _ in ev_candidates]
+        all_ids = [cid for cid, _ in ev_lines]
         matched_evs = (matched_evs + all_ids)[:3]
     if len(matched_evs) < 2:
-        matched_evs = ["ev_primary", "ev_secondary"]
+        matched_evs = ["ev_1", "ev_2"]
     chosen_evidence = matched_evs[:3]
 
-    # Select minimal necessary diagnostic tool
     root_tokens = set(re.split(r"[_\s\-]+", best_root.lower()))
     def score_tool(t):
         text = (t.get("name", "") + " " + t.get("description", "")).lower()
         return sum(1 for tok in root_tokens if tok in text)
 
     sorted_diags = sorted(diag_tools, key=score_tool, reverse=True)
-    selected_diag_tools = sorted_diags[:1] if sorted_diags else []
+    selected_diag_tools = sorted_diags[:max(1, min(2, max_diag))] if sorted_diags else []
 
     diagnostics = []
     for t in selected_diag_tools:
-        args = build_valid_tool_args(t, service, transcript)
-        diagnostics.append({
-            "toolName": t.get("name"),
-            "arguments": args,
-            "evidence": [chosen_evidence[0]]
-        })
+        args = extract_tool_arguments_from_transcript(t, service, transcript)
+        diagnostics.append({"toolName": t.get("name"), "arguments": args})
 
     return best_root, chosen_evidence, diagnostics
 
-def build_valid_tool_args(tool: dict, service: str, transcript: str) -> dict:
+def extract_tool_arguments_from_transcript(tool: dict, service: str, transcript: str) -> dict:
     schema = tool.get("inputSchema", {})
     props = schema.get("properties", {})
     args = {}
+
     for p_name, p_spec in props.items():
         low = p_name.lower()
         p_type = p_spec.get("type", "string")
@@ -137,10 +134,19 @@ def build_valid_tool_args(tool: dict, service: str, transcript: str) -> dict:
         elif "region" in low:
             m = re.search(r"\b(us-east-1|us-west-2|eu-west-1|ap-south-1)\b", transcript)
             args[p_name] = m.group(1) if m else "us-east-1"
+        elif "host" in low or "node" in low or "instance" in low:
+            m = re.search(r"\b([a-z0-9\-]+(?:host|node|worker|prod)[a-z0-9\-]*)\b", transcript, re.I)
+            args[p_name] = m.group(1) if m else f"{service}-worker-1"
+        elif "pod" in low:
+            m = re.search(rf"\b({service}-[a-z0-9]+-[a-z0-9]+)\b", transcript)
+            args[p_name] = m.group(1) if m else f"{service}-pod-01"
+        elif "metric" in low:
+            m = re.search(r"\b(cpu[_\w]*|memory[_\w]*|error_rate|latency|request_count)\b", transcript, re.I)
+            args[p_name] = m.group(1) if m else "error_rate"
         elif "cluster" in low:
             args[p_name] = f"{service}-prod"
-        elif "metric" in low:
-            args[p_name] = "error_rate"
+        elif "namespace" in low or "env" in low:
+            args[p_name] = "production"
         elif p_type == "integer":
             args[p_name] = p_spec.get("default", 10)
         elif p_type == "boolean":
@@ -149,10 +155,11 @@ def build_valid_tool_args(tool: dict, service: str, transcript: str) -> dict:
             args[p_name] = p_spec["enum"][0]
         else:
             args[p_name] = service
+
     return args
 
 # ---------------------------------------------------------------------------
-# OTLP Trace Generator conforming strictly to Specification Diagram
+# OTLP Trace Generator strictly matching the Specification Topology
 # ---------------------------------------------------------------------------
 
 def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, receipt_log, approval_log, num_diagnostics):
@@ -274,7 +281,6 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
 
         spans.append(client_span)
 
-    # Required incident.join span when diagnostics fan out
     if num_diagnostics > 1 and len(diagnostic_exec_spans) > 1:
         join_span_id = sha(f"join_{run_id}")[:16]
         links = [{"traceId": trace_id, "spanId": sid, "attributes": common_attrs} for sid in diagnostic_exec_spans]
@@ -290,7 +296,6 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "links": links
         })
 
-    # Required approval_gate span when approval receipt occurred
     for a in approval_log:
         spans.append({
             "traceId": trace_id,
@@ -314,7 +319,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
     }
 
 # ---------------------------------------------------------------------------
-# Endpoints: POST /v2/incidents, receipts, and GET
+# Endpoints
 # ---------------------------------------------------------------------------
 
 @router.post("/v2/incidents")
@@ -347,7 +352,7 @@ async def create_incident(request: Request):
     policy = body.get("policy", {})
     service = incident_data.get("service", "target-service")
 
-    root_cause, evidence, diag_calls = plan_with_ai(incident_data, catalog, policy)
+    root_cause, evidence, diag_calls = plan_incident(incident_data, catalog, policy)
 
     dispatches = []
     for idx, d_call in enumerate(diag_calls):
@@ -376,7 +381,6 @@ async def create_incident(request: Request):
         "approvals": []
     }
 
-    # Decide effect tool & check scaling limit rule
     effect_tools = policy.get("effectTools", ["rollback_deployment"])
     transcript_low = incident_data.get("transcript", "").lower()
     if any(k in transcript_low for k in ["scaling limit", "max replicas", "already at limit", "cannot scale"]) and "page_owner" in effect_tools:
@@ -459,7 +463,6 @@ async def handle_receipts(runId: str, request: Request):
         elif int(o.get("status", 200)) == 0 or o.get("errorType") == "timeout":
             has_timeout = True
 
-    # 1. 503 Retry response
     if retry_dispatches:
         resp = {
             "runId": runId,
@@ -474,7 +477,6 @@ async def handle_receipts(runId: str, request: Request):
              (receipt_key, rh, json.dumps(resp)))])
         return JSONResponse(resp)
 
-    # 2. Timeout suppression
     if has_timeout:
         trace = build_otlp_trace(runId, state["publicMarker"], state["traceId"], state["agentModel"],
                                  state["actionLog"], state["receiptLog"], state["approvalLog"], state.get("numDiagnostics", 1))
@@ -494,7 +496,6 @@ async def handle_receipts(runId: str, request: Request):
              (receipt_key, rh, json.dumps(resp)))])
         return JSONResponse(resp)
 
-    # 3. Handle Approval Receipt
     if approvals_in:
         appr = approvals_in[0]
         state["approvalLog"].append(appr)
@@ -536,7 +537,6 @@ async def handle_receipts(runId: str, request: Request):
              (receipt_key, rh, json.dumps(resp)))])
         return JSONResponse(resp)
 
-    # 4. Check if diagnostics completed -> Request Approval or Dispatch Effect
     chosen_effect_tool = state.get("chosenEffectTool", {"name": "rollback_deployment"})
     effect_name = chosen_effect_tool.get("name", "rollback_deployment")
     appr_required = state["policy"].get("approvalRequiredFor", [])
@@ -545,7 +545,7 @@ async def handle_receipts(runId: str, request: Request):
     if not has_effect_outcome:
         eff_act_id = "act_" + sha(f"{runId}|effect|{effect_name}")[:16]
         eff_call_id = "call_" + sha(f"{runId}|effect|{effect_name}")[:16]
-        eff_args = build_valid_tool_args(chosen_effect_tool, state["service"], "")
+        eff_args = extract_tool_arguments_from_transcript(chosen_effect_tool, state["service"], "")
 
         state["pendingEffectTool"] = effect_name
         state["pendingActionId"] = eff_act_id
@@ -597,7 +597,6 @@ async def handle_receipts(runId: str, request: Request):
                  (receipt_key, rh, json.dumps(resp)))])
             return JSONResponse(resp)
 
-    # 5. Terminal Completion
     trace = build_otlp_trace(runId, state["publicMarker"], state["traceId"], state["agentModel"],
                              state["actionLog"], state["receiptLog"], state["approvalLog"], state.get("numDiagnostics", 1))
 
