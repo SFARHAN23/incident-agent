@@ -24,7 +24,7 @@ def health(request: Request):
         "endpoints": {
             "task2_a2a_base": f"https://{host}/a2a/",
             "task3_mailroom": f"https://{host}/mailroom/propose",
-            "task4_incident": f"https://{host}/incident/v2/incidents"
+            "task4_incident": f"https://{host}/incident"
         }
     }
 
@@ -50,15 +50,8 @@ def agent_card(request: Request):
 
 # Mount Routers
 app.include_router(a2a_router.router, prefix="/a2a", tags=["Task 2: Invoice Agent"])
-app.include_router(mailroom_router.router, prefix="/mailroom", tags=["Task 3: Safe Mailroom"])
-app.include_router(incident_router.router, prefix="/incident", tags=["Task 4: Incident Triage"])
-# Mount incident router at root for direct /v2/incidents requests
-app.include_router(incident_router.router, tags=["Task 4: Direct v2 Aliases"])
-
-# Root aliases for mailroom
-@app.post("/propose")
-async def root_propose(request: Request):
-    return await mailroom_router.propose_route(request)
+app.include_router(mailroom_router.router, tags=["Task 3: Safe Mailroom"])
+app.include_router(incident_router.router, tags=["Task 4: Incident Triage"])
 
 if __name__ == "__main__":
     import uvicorn
