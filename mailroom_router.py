@@ -81,8 +81,8 @@ async def execute_route(request: Request):
     rows = q("SELECT receipt_token, decision FROM mailroom_cases WHERE case_id=?", (case_id,))
     if not rows:
         return JSONResponse({"error": "Case not found"}, status_code=404)
-    if rows[0]["receipt_token"] != token or not sig:
+    if rows[0][0] != token or not sig:
         return JSONResponse({"error": "Invalid signed receipt scope"}, status_code=400)
 
     q("UPDATE mailroom_cases SET executed=1 WHERE case_id=?", (case_id,))
-    return JSONResponse({"status": "COMPLETED", "caseId": case_id, "action": rows[0]["decision"]})
+    return JSONResponse({"status": "COMPLETED", "caseId": case_id, "action": rows[0][1]})
