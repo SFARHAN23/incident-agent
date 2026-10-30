@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
-import json, hashlib, uuid, time
+import json, hashlib, uuid
 from datetime import datetime, timezone
 from database import q, tx
 from invoice_logic import extract_package_decision
@@ -18,52 +18,66 @@ def canon(x): return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure
 def sha(s): return hashlib.sha256(s.encode()).hexdigest()
 def now(): return datetime.now(timezone.utc).isoformat()
 def reply(obj, status=200): return Response(json.dumps(obj, ensure_ascii=False).encode(), status_code=status, media_type=MT)
-def err(status, code): return reply({"error": {"code": code, "message": "Request failed"}}, status)
+def err(status, code): return reply({"error": {"code": code, "message": "Request could not be processed."}}, status)
 
-def get_principal(request: Request):
+def gate(request: Request, need_json=False):
     h = request.headers.get("authorization", "")
-    tok = h[7:].strip() if h.startswith("Bearer ") else (h.strip() or "anonymous_bearer")
-    return sha(tok)[:32]
+    tok = h[7:].strip() if h.startswith("Bearer ") else ""
+    if not tok:
+        return None, err(401, "UNAUTHENTICATED")
+    if request.headers.get("a2a-version") != "1.0":
+        return None, err(400, "VERSION_NOT_SUPPORTED")
+    if need_json:
+        ct = request.headers.get("content-type", "").lower()
+        if not (ct.startswith(MT) or ct.startswith("application/json")):
+            return None, err(415, "UNSUPPORTED_MEDIA_TYPE")
+    return sha(tok)[:32], None
 
 @router.get("/tasks")
 def list_tasks(request: Request):
-    p = get_principal(request)
+    p, bad = gate(request)
+    if bad: return bad
     rows = q("SELECT body FROM tasks WHERE principal=? ORDER BY rowid", (p,))
-    return reply({"tasks": [json.loads(r["body"]) for r in rows]})
+    return reply({"tasks": [json.loads(r[0]) for r in rows]})
 
 @router.get("/tasks/{tid}")
 def get_task(tid: str, request: Request):
-    p = get_principal(request)
+    p, bad = gate(request)
+    if bad: return bad
     rows = q("SELECT body FROM tasks WHERE id=? AND principal=?", (tid, p))
-    return reply(json.loads(rows[0]["body"])) if rows else err(404, "NOT_FOUND")
+    return reply(json.loads(rows[0][0])) if rows else err(404, "NOT_FOUND")
 
 @router.post("/tasks/{tid}:cancel")
 def cancel_task(tid: str, request: Request):
-    p = get_principal(request)
+    p, bad = gate(request)
+    if bad: return bad
     rows = q("SELECT body FROM tasks WHERE id=? AND principal=?", (tid, p))
     if not rows: return err(404, "NOT_FOUND")
-    t = json.loads(rows[0]["body"])
+    t = json.loads(rows[0][0])
     if t["status"]["state"] in (DONE, CANC): return err(409, "TASK_NOT_CANCELABLE")
     t["status"] = {"state": CANC, "timestamp": now()}
     q("UPDATE tasks SET body=? WHERE id=? AND principal=?", (json.dumps(t), tid, p))
     return reply(t)
 
 @router.post("/message:send")
+@router.post("/message%3Asend")
 async def send_message(request: Request):
-    p = get_principal(request)
+    p, bad = gate(request, need_json=True)
+    if bad: return bad
     try: body = await request.json()
     except Exception: return err(400, "INVALID_REQUEST")
     msg = body.get("message")
-    if not isinstance(msg, dict) or not msg.get("messageId"): return err(400, "INVALID_REQUEST")
+    if not isinstance(msg, dict) or not msg.get("messageId") or msg.get("role") != "ROLE_USER":
+        return err(400, "INVALID_REQUEST")
 
     mid = str(msg["messageId"])
     h = sha(canon(msg))
 
-    row = q("SELECT hash, task_id FROM msgs WHERE principal=? AND mid=?", (p, mid))
-    if row:
-        if row[0]["hash"] != h: return err(409, "IDEMPOTENCY_CONFLICT")
-        t_row = q("SELECT body FROM tasks WHERE id=? AND principal=?", (row[0]["task_id"], p))
-        return reply({"task": json.loads(t_row[0]["body"])}) if t_row else err(404, "NOT_FOUND")
+    rows = q("SELECT hash, task_id FROM msgs WHERE principal=? AND mid=?", (p, mid))
+    if rows:
+        if rows[0][0] != h: return err(409, "IDEMPOTENCY_CONFLICT")
+        t_row = q("SELECT body FROM tasks WHERE id=? AND principal=?", (rows[0][1], p))
+        return reply({"task": json.loads(t_row[0][0])}) if t_row else err(404, "NOT_FOUND")
 
     if msg.get("taskId"):
         return handle_continuation(p, msg, mid, h)
@@ -75,6 +89,7 @@ def handle_initial(p, msg, mid, h):
     data = parts[0].get("data", {})
     pkgs = data.get("packages", [])
     batch_id = data.get("batchId", "batch_default")
+    if not pkgs: return err(400, "INVALID_REQUEST")
 
     proposals = []
     for pkg in pkgs:
@@ -109,7 +124,7 @@ def handle_continuation(p, msg, mid, h):
     tid = msg["taskId"]
     rows = q("SELECT body FROM tasks WHERE id=? AND principal=?", (tid, p))
     if not rows: return err(404, "NOT_FOUND")
-    t = json.loads(rows[0]["body"])
+    t = json.loads(rows[0][0])
     if t["status"]["state"] != IR: return err(409, "TASK_NOT_ACTIVE")
 
     parts = msg.get("parts", [])
@@ -127,7 +142,7 @@ def handle_continuation(p, msg, mid, h):
                 "packageId": pkg_id,
                 "actionId": s["actionId"],
                 "action": s["action"],
-                "receiptNonce": r.get("receiptNonce", "nonce_ok"),
+                "receiptNonce": r.get("receiptNonce", "nonce_default"),
                 "facts": s["facts"],
                 "evidenceRefs": s["evidenceRefs"]
             })
