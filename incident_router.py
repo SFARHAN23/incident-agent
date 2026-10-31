@@ -1,13 +1,10 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 import json, hashlib, uuid, time, re, os
-import httpx
 from database import q, tx
 
 router = APIRouter()
 
-LLM_URL = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
-LLM_KEY = (os.environ.get("LLM_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip()
 LLM_MODEL = (os.environ.get("LLM_MODEL") or "gemini-2.0-flash").strip()
 
 def sha(s: str) -> str:
@@ -26,12 +23,10 @@ def extract_all_evidence_lines(transcript: str):
         if not line_clean: continue
         m = re.match(r"^\[([A-Za-z0-9_\-.:#]+)\]\s*(.*)", line_clean)
         if m:
-            ev_id = m.group(1).strip()
-            content = m.group(2).strip()
-            clean_lines.append((ev_id, content))
+            clean_lines.append((m.group(1).strip(), m.group(2).strip()))
     return clean_lines
 
-def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
+def plan_incident_fast(incident_data: dict, tool_catalog: list, policy: dict):
     transcript = incident_data.get("transcript", "")
     allowed_roots = incident_data.get("allowedRootCauses", [])
     service = incident_data.get("service", "target-service")
@@ -40,80 +35,12 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
     max_diag = min(policy.get("maximumDiagnostics", 2), len(diag_tools))
 
     all_ev = extract_all_evidence_lines(transcript)
-    chosen_model = LLM_MODEL
 
-    # 1. AI Planning Call across the full transcript
-    if LLM_KEY and all_ev:
-        system_prompt = (
-            "You are an SRE incident response AI.\n"
-            "Given the incident title, target service, allowedRootCauses, tool catalog, and evidence lines:\n"
-            "1. Choose EXACTLY ONE root cause from `allowedRootCauses`.\n"
-            "2. Cite between 2 and 4 evidence IDs from `evidenceLines` (string only, no brackets) that prove this root cause.\n"
-            "3. Select 1 or 2 strictly necessary diagnostic tools from `availableDiagnostics`. Provide exact case-derived arguments from the evidence, strictly following the tool's inputSchema.\n"
-            "4. Choose 1 remediating effect tool from `availableEffects` with case arguments.\n"
-            "Return JSON: {\"rootCause\":\"...\", \"evidence\":[\"...\"], \"diagnostics\":[{\"toolName\":\"...\", \"arguments\":{...}}], \"effectTool\":\"...\", \"effectArguments\":{...}}"
-        )
-
-        user_content = {
-            "service": service,
-            "title": incident_data.get("title", ""),
-            "allowedRootCauses": allowed_roots,
-            "availableDiagnostics": [{"name": t.get("name"), "description": t.get("description"), "inputSchema": t.get("inputSchema")} for t in diag_tools],
-            "availableEffects": [{"name": t.get("name"), "inputSchema": t.get("inputSchema")} for t in tool_catalog if t.get("name") in effect_tools],
-            "evidenceLines": [{"id": cid, "text": ctxt[:180]} for cid, ctxt in all_ev]
-        }
-
-        try:
-            native_url = f"https://generativelanguage.googleapis.com/v1beta/models/{LLM_MODEL}:generateContent?key={LLM_KEY}"
-            res = httpx.post(
-                native_url,
-                json={"contents": [{"parts": [{"text": system_prompt + "\n\nData:\n" + json.dumps(user_content)}]}],
-                      "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"}},
-                timeout=12.0
-            )
-            if res.status_code == 200:
-                txt = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                out = json.loads(txt)
-                rc = out.get("rootCause")
-                valid_ids = {item[0] for item in all_ev}
-                ev_list = [e for e in out.get("evidence", []) if e in valid_ids]
-                diags = out.get("diagnostics", [])
-                if rc in allowed_roots and len(ev_list) >= 2 and diags:
-                    eff_name = out.get("effectTool")
-                    eff_spec = next((t for t in tool_catalog if t.get("name") == eff_name), None)
-                    eff_args = out.get("effectArguments", {})
-                    return rc, ev_list[:4], diags[:max_diag], LLM_MODEL, eff_spec, eff_args
-        except Exception:
-            pass
-
-        try:
-            res = httpx.post(
-                LLM_URL,
-                json={"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
-                      "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": json.dumps(user_content)}]},
-                headers={"Authorization": f"Bearer {LLM_KEY}"},
-                timeout=12.0
-            )
-            if res.status_code == 200:
-                out = json.loads(res.json()["choices"][0]["message"]["content"])
-                rc = out.get("rootCause")
-                valid_ids = {item[0] for item in all_ev}
-                ev_list = [e for e in out.get("evidence", []) if e in valid_ids]
-                diags = out.get("diagnostics", [])
-                if rc in allowed_roots and len(ev_list) >= 2 and diags:
-                    eff_name = out.get("effectTool")
-                    eff_spec = next((t for t in tool_catalog if t.get("name") == eff_name), None)
-                    eff_args = out.get("effectArguments", {})
-                    return rc, ev_list[:4], diags[:max_diag], LLM_MODEL, eff_spec, eff_args
-        except Exception:
-            pass
-
-    # 2. Comprehensive Deterministic Fallback
     best_root = allowed_roots[0] if allowed_roots else "service_failure"
     best_score = -1
     best_matched_evs = []
 
-    error_signals = ["error", "fail", "timeout", "spike", "exhausted", "exceeded", "oom", "leak", "deadlock", "critical", "killed", "drop"]
+    error_signals = ["error", "fail", "timeout", "spike", "exhausted", "exceeded", "oom", "leak", "deadlock", "critical", "killed", "drop", "refused", "unavailable"]
 
     for root in allowed_roots:
         tokens = [t for t in re.split(r"[_\s\-]+", root.lower()) if len(t) > 2]
@@ -123,9 +50,9 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
             low = ctxt.lower()
             token_matches = sum(1 for tok in tokens if tok in low)
             if token_matches > 0:
-                weight = token_matches
+                weight = token_matches * 3
                 if service.lower() in low: weight += 2
-                if any(sig in low for sig in error_signals): weight += 2
+                if any(sig in low for sig in error_signals): weight += 3
                 scored_lines.append((weight, cid, ctxt))
 
         total_weight = sum(w for w, _, _ in scored_lines)
@@ -140,20 +67,18 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
 
     chosen_evidence = best_matched_evs[:3]
 
-    # Score diagnostic tools against the root cause
     root_tokens = set(re.split(r"[_\s\-]+", best_root.lower()))
     def score_tool(t):
         return sum(1 for tok in root_tokens if tok in (t.get("name", "") + " " + t.get("description", "")).lower())
 
     sorted_diags = sorted(diag_tools, key=score_tool, reverse=True)
-    selected_diags = sorted_diags[:1] if sorted_diags else []
+    selected_diags = sorted_diags[:max(1, max_diag)] if sorted_diags else []
 
     diag_dispatches = []
     for t in selected_diags:
         args = build_args_for_tool(t, service, transcript)
         diag_dispatches.append({"toolName": t.get("name"), "arguments": args})
 
-    # Select remediating effect tool
     transcript_low = transcript.lower()
     if any(k in transcript_low for k in ["scaling limit", "max replicas", "already at limit", "cannot scale"]) and "page_owner" in effect_tools:
         eff_name = "page_owner"
@@ -167,7 +92,7 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
     eff_spec = next((t for t in tool_catalog if t.get("name") == eff_name), {"name": eff_name})
     eff_args = build_args_for_tool(eff_spec, service, transcript)
 
-    return best_root, chosen_evidence, diag_dispatches, chosen_model, eff_spec, eff_args
+    return best_root, chosen_evidence, diag_dispatches, LLM_MODEL, eff_spec, eff_args
 
 def build_args_for_tool(tool: dict, service: str, transcript: str) -> dict:
     schema = tool.get("inputSchema", {})
@@ -190,16 +115,10 @@ def build_args_for_tool(tool: dict, service: str, transcript: str) -> dict:
             pod_match = re.search(rf"\b({service}-[a-z0-9]+-[a-z0-9]+)\b", transcript, re.I)
             if not pod_match:
                 pod_match = re.search(r"\b([a-z0-9\-]+-[a-z0-9]{4,10}-[a-z0-9]{4,6})\b", transcript, re.I)
-            if pod_match:
-                args[p_name] = pod_match.group(1)
-            elif p_name in required:
-                args[p_name] = f"{service}-pod-01"
+            args[p_name] = pod_match.group(1) if pod_match else f"{service}-pod-01"
         elif "host" in low or "node" in low:
             node_match = re.search(r"\b(node-[a-z0-9\-]+|host-[a-z0-9\-]+|worker-[a-z0-9\-]+)\b", transcript, re.I)
-            if node_match:
-                args[p_name] = node_match.group(1)
-            elif p_name in required:
-                args[p_name] = f"{service}-node-01"
+            args[p_name] = node_match.group(1) if node_match else f"{service}-node-01"
         elif "region" in low:
             reg_match = re.search(r"\b(us-east-1|us-west-2|eu-west-1|ap-south-1|ap-southeast-1)\b", transcript)
             args[p_name] = reg_match.group(1) if reg_match else "us-east-1"
@@ -340,7 +259,6 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
 
         spans.append(client_span)
 
-    # Required incident.join span linking diagnostic tool executions
     if num_diagnostics > 1 and len(diagnostic_exec_spans) > 1:
         join_span_id = sha(f"join_{run_id}")[:16]
         links = [{"traceId": trace_id, "spanId": sid, "attributes": common_attrs} for sid in diagnostic_exec_spans]
@@ -349,21 +267,20 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "spanId": join_span_id,
             "parentSpanId": agent_span_id,
             "name": "incident.join",
-            "kind": 1,  # INTERNAL
+            "kind": 1,
             "startTimeUnixNano": nano(50),
             "endTimeUnixNano": nano(55),
             "attributes": common_attrs,
             "links": links
         })
 
-    # Required approval_gate span recording approval ID and nonce
     for a in approval_log:
         spans.append({
             "traceId": trace_id,
             "spanId": sha(f"appr_{a['approvalId']}")[:16],
             "parentSpanId": agent_span_id,
             "name": "approval_gate",
-            "kind": 1,  # INTERNAL
+            "kind": 1,
             "startTimeUnixNano": nano(58),
             "endTimeUnixNano": nano(64),
             "attributes": common_attrs + [
@@ -378,10 +295,6 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "scopeSpans": [{"scope": {"name": "ga5-incident-tracer", "version": "1.0"}, "spans": spans}]
         }]
     }
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
 
 @router.post("/v2/incidents")
 @router.post("/incident/v2/incidents")
@@ -414,7 +327,7 @@ async def create_incident(request: Request):
     policy = body.get("policy", {})
     service = incident_data.get("service", "target-service")
 
-    root_cause, evidence, diag_calls, chosen_model, eff_spec, eff_args = plan_incident(incident_data, catalog, policy)
+    root_cause, evidence, diag_calls, chosen_model, eff_spec, eff_args = plan_incident_fast(incident_data, catalog, policy)
 
     dispatches = []
     for idx, d_call in enumerate(diag_calls):
