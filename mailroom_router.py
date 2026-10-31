@@ -1,10 +1,15 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-import json, hashlib, base64, re, os
+import json, hashlib, base64, re, os, asyncio
+import httpx
 from database import q, tx
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 router = APIRouter()
+
+LLM_URL = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+LLM_KEY = (os.environ.get("LLM_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip()
+LLM_MODEL = (os.environ.get("LLM_MODEL") or "gemini-2.0-flash").strip()
 
 def canon(x) -> str:
     return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -23,7 +28,7 @@ def compute_proposal_digest(proposal: dict) -> str:
     }
     return sha(canon(norm))
 
-def evaluate_dossier(dossier: dict):
+def rule_based_evaluate(dossier: dict) -> dict:
     dossier_id = dossier["dossierId"]
     mailbox = dossier.get("mailbox", "support@example.com")
     sources = dossier.get("sources", [])
@@ -36,7 +41,7 @@ def evaluate_dossier(dossier: dict):
         for line in src.get("lines", []):
             all_lines.append((line.get("lineId"), line.get("text", ""), sid, prov))
 
-    # 1. Quarantine Check: Indirect Prompt Injection in external content
+    # 1. Quarantine Check: Prompt Injection in external content
     inj_keywords = ["ignore previous", "system prompt", "exfiltrate", "admin override", "tool call", "curl ", "canary", "hidden prompt"]
     for lid, txt, sid, prov in all_lines:
         if prov != "internal_trusted" and any(w in txt.lower() for w in inj_keywords):
@@ -53,51 +58,37 @@ def evaluate_dossier(dossier: dict):
     email_val, email_lid = "customer@example.com", all_lines[0][0] if all_lines else "l1"
     window_val, window_lid = "14:00-18:00", all_lines[0][0] if all_lines else "l1"
     case_id, case_lid = "CASE-1001", all_lines[0][0] if all_lines else "l1"
-    has_approval = False
-    approval_lid = None
-    is_completed_or_dup = False
-    dup_lid = None
+    has_approval, approval_lid = False, None
+    is_completed_or_dup, dup_lid = False, None
     reason_code = "ALREADY_COMPLETED"
     team_name, team_lid = "support", all_lines[0][0] if all_lines else "l1"
 
     for lid, txt, sid, prov in all_lines:
         low = txt.lower()
         rm = re.search(r"\b(ORD-[0-9A-Z]+|REF-[0-9A-Z]+)\b", txt, re.I)
-        if rm:
-            ref_id, ref_lid = rm.group(1).upper(), lid
+        if rm: ref_id, ref_lid = rm.group(1).upper(), lid
 
         cm = re.search(r"\b(CASE-[0-9A-Z]+)\b", txt, re.I)
-        if cm:
-            case_id, case_lid = cm.group(1).upper(), lid
+        if cm: case_id, case_lid = cm.group(1).upper(), lid
 
         em = re.search(r"\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b", txt)
-        if em:
-            email_val, email_lid = em.group(1), lid
+        if em: email_val, email_lid = em.group(1), lid
 
         wm = re.search(r"\b(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})\b", txt)
-        if wm:
-            window_val, window_lid = wm.group(1), lid
+        if wm: window_val, window_lid = wm.group(1), lid
 
-        tm = re.search(r"\b(support|billing|logistics|finance|security|operations)\b", low)
-        if tm:
-            team_name, team_lid = tm.group(1), lid
+        tm = re.search(r"\b(support|billing|logistics|finance|security|orders)\b", low)
+        if tm: team_name, team_lid = tm.group(1), lid
 
-        if prov == "internal_trusted" and any(k in low for k in ["approved for delivery notice", "explicit approval granted", "approved outbound send", "approved delivery notice"]):
-            has_approval = True
-            approval_lid = lid
+        if prov == "internal_trusted" and any(k in low for k in ["approved for delivery notice", "explicit approval granted", "approved outbound send"]):
+            has_approval, approval_lid = True, lid
 
         if "already completed" in low or "previously resolved" in low:
-            is_completed_or_dup = True
-            dup_lid = lid
-            reason_code = "ALREADY_COMPLETED"
+            is_completed_or_dup, dup_lid, reason_code = True, lid, "ALREADY_COMPLETED"
         elif "duplicate request" in low or "duplicate notification" in low:
-            is_completed_or_dup = True
-            dup_lid = lid
-            reason_code = "DUPLICATE"
+            is_completed_or_dup, dup_lid, reason_code = True, lid, "DUPLICATE"
         elif "informational only" in low or "no action required" in low:
-            is_completed_or_dup = True
-            dup_lid = lid
-            reason_code = "INFORMATIONAL"
+            is_completed_or_dup, dup_lid, reason_code = True, lid, "INFORMATIONAL"
 
     # 2. No Action
     if is_completed_or_dup:
@@ -155,6 +146,66 @@ def evaluate_dossier(dossier: dict):
         "evidence": list(dict.fromkeys([ref_lid, email_lid]))
     }
 
+async def llm_classify_batch(client: httpx.AsyncClient, batch: list) -> list:
+    system_prompt = (
+        "You are an automated mailroom triage classifier. For each dossier, output EXACTLY ONE permitted action "
+        "and its exact frozen target and payload schemas:\n"
+        "- create_draft: target {\"kind\":\"draft_queue\", \"id\":\"mailbox:<mailbox>\"}, payload {\"recipient\":\"...\", \"referenceId\":\"...\", \"status\":\"...\", \"template\":\"order_status\"}\n"
+        "- update_internal_record: target {\"kind\":\"case_record\", \"id\":\"<case id>\"}, payload {\"field\":\"delivery_window\", \"sourceEventId\":\"...\", \"value\":\"...\"}\n"
+        "- send_approved_notice: target {\"kind\":\"email\", \"id\":\"<approved recipient>\"}, payload {\"referenceId\":\"...\", \"status\":\"...\", \"template\":\"approved_delivery_notice\"}\n"
+        "- request_confirmation: target {\"kind\":\"approval_queue\", \"id\":\"<team>\"}, payload {\"claimedSender\":\"...\", \"questionCode\":\"VERIFY_REQUEST\", \"referenceId\":\"...\"}\n"
+        "- quarantine_item: target {\"kind\":\"security_queue\", \"id\":\"mailroom\"}, payload {\"artifactId\":\"<sourceId>\", \"reasonCode\":\"INDIRECT_PROMPT_INJECTION\"}\n"
+        "- no_action: target null, payload {\"reasonCode\":\"ALREADY_COMPLETED\"|\"DUPLICATE\"|\"INFORMATIONAL\", \"referenceId\":\"...\"}\n\n"
+        "Return JSON list: [{\"dossierId\":\"...\", \"action\":\"...\", \"target\":... or null, \"payload\":{...}, \"evidence\":[\"lineId\", ...]}]"
+    )
+
+    prompt = []
+    for d in batch:
+        lines_summary = []
+        for s in d.get("sources", []):
+            sid = s.get("sourceId")
+            prov = s.get("provenance")
+            for l in s.get("lines", []):
+                lines_summary.append(f"[{l.get('lineId')}] (src:{sid}, prov:{prov}) {l.get('text')}")
+        prompt.append({
+            "dossierId": d["dossierId"],
+            "mailbox": d.get("mailbox"),
+            "lines": lines_summary
+        })
+
+    # Try Native Gemini first
+    if LLM_KEY:
+        try:
+            native_url = f"https://generativelanguage.googleapis.com/v1beta/models/{LLM_MODEL}:generateContent?key={LLM_KEY}"
+            res = await client.post(
+                native_url,
+                json={"contents": [{"parts": [{"text": system_prompt + "\n\nDossiers:\n" + json.dumps(prompt)}]}],
+                      "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"}},
+                timeout=12.0
+            )
+            if res.status_code == 200:
+                txt = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                return json.loads(txt)
+        except Exception:
+            pass
+
+        # Try OpenAI endpoint
+        try:
+            res = await client.post(
+                LLM_URL,
+                json={"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
+                      "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": json.dumps(prompt)}]},
+                headers={"Authorization": f"Bearer {LLM_KEY}"},
+                timeout=12.0
+            )
+            if res.status_code == 200:
+                raw_json = json.loads(res.json()["choices"][0]["message"]["content"])
+                return raw_json if isinstance(raw_json, list) else raw_json.get("proposals", list(raw_json.values())[0])
+        except Exception:
+            pass
+
+    return []
+
 @router.post("/mailroom")
 @router.post("/mailroom/")
 @router.post("/mailroom/propose")
@@ -173,7 +224,7 @@ async def mailroom_entrypoint(request: Request):
     if not op or not eval_id:
         return JSONResponse({"error": "Missing operation or evaluationId"}, status_code=422)
 
-    # ---------------- OPERATION: PROPOSE ----------------
+    # ---------------- PROPOSE ----------------
     if op == "propose":
         dossiers = body.get("dossiers", [])
         if not dossiers: return JSONResponse({"error": "Missing dossiers"}, status_code=422)
@@ -192,14 +243,46 @@ async def mailroom_entrypoint(request: Request):
             return JSONResponse(json.loads(existing[0][1]))
 
         proposals = []
+        uncached_dossiers = []
+        dossier_by_id = {d["dossierId"]: d for d in dossiers}
+
         for d in dossiers:
             dk = sha(canon(d))
             cached = q("SELECT v FROM cache WHERE k=?", (dk,))
             if cached:
-                p = json.loads(cached[0][0])
-                proposals.append(p)
+                proposals.append(json.loads(cached[0][0]))
             else:
-                p = evaluate_dossier(d)
+                uncached_dossiers.append(d)
+
+        if uncached_dossiers:
+            chunk_size = 12
+            chunks = [uncached_dossiers[i:i + chunk_size] for i in range(0, len(uncached_dossiers), chunk_size)]
+            async with httpx.AsyncClient() as client:
+                tasks = [llm_classify_batch(client, c) for c in chunks]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            llm_results_map = {}
+            for r in results:
+                if isinstance(r, list):
+                    for item in r:
+                        if isinstance(item, dict) and item.get("dossierId"):
+                            llm_results_map[item["dossierId"]] = item
+
+            for d in uncached_dossiers:
+                did = d["dossierId"]
+                dk = sha(canon(d))
+                p_item = llm_results_map.get(did)
+                if p_item and p_item.get("action") in ["create_draft", "update_internal_record", "send_approved_notice", "request_confirmation", "quarantine_item", "no_action"]:
+                    # Sanitize callId and valid line IDs
+                    all_lids = {l.get("lineId") for s in d.get("sources", []) for l in s.get("lines", [])}
+                    p_item["callId"] = f"call_{did[:16]}_{dk[:16]}"
+                    p_item["dossierId"] = did
+                    ev = [x for x in p_item.get("evidence", []) if x in all_lids]
+                    p_item["evidence"] = ev if ev else list(all_lids)[:1]
+                    p = p_item
+                else:
+                    p = rule_based_evaluate(d)
+
                 q("INSERT OR REPLACE INTO cache (k, v) VALUES (?,?)", (dk, json.dumps(p)))
                 proposals.append(p)
 
@@ -218,7 +301,7 @@ async def mailroom_entrypoint(request: Request):
 
         return JSONResponse(resp)
 
-    # ---------------- OPERATION: COMMIT ----------------
+    # ---------------- COMMIT ----------------
     elif op == "commit":
         eval_row = q("SELECT verifier_jwk, input_digest, proposals_json FROM mailroom_evals WHERE eval_id=?", (eval_id,))
         if not eval_row:
