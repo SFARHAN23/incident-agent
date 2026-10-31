@@ -23,7 +23,7 @@ def compute_proposal_digest(proposal: dict) -> str:
     }
     return sha(canon(norm))
 
-def extract_dossier_features(dossier: dict):
+def evaluate_dossier(dossier: dict):
     dossier_id = dossier["dossierId"]
     mailbox = dossier.get("mailbox", "support@example.com")
     sources = dossier.get("sources", [])
@@ -58,6 +58,7 @@ def extract_dossier_features(dossier: dict):
     is_completed_or_dup = False
     dup_lid = None
     reason_code = "ALREADY_COMPLETED"
+    team_name, team_lid = "support", all_lines[0][0] if all_lines else "l1"
 
     for lid, txt, sid, prov in all_lines:
         low = txt.lower()
@@ -77,7 +78,11 @@ def extract_dossier_features(dossier: dict):
         if wm:
             window_val, window_lid = wm.group(1), lid
 
-        if any(k in low for k in ["approved for delivery notice", "explicit approval granted", "approved outbound send"]):
+        tm = re.search(r"\b(support|billing|logistics|finance|security|operations)\b", low)
+        if tm:
+            team_name, team_lid = tm.group(1), lid
+
+        if prov == "internal_trusted" and any(k in low for k in ["approved for delivery notice", "explicit approval granted", "approved outbound send", "approved delivery notice"]):
             has_approval = True
             approval_lid = lid
 
@@ -105,7 +110,7 @@ def extract_dossier_features(dossier: dict):
             "evidence": list(dict.fromkeys([dup_lid or ref_lid, ref_lid]))
         }
 
-    # 3. Update Internal Record (authorized delivery window)
+    # 3. Update Internal Record
     if "delivery_window" in " ".join(t for _, t, _, _ in all_lines).lower():
         src_id = sources[0].get("sourceId", "src_1")
         return {
@@ -117,7 +122,7 @@ def extract_dossier_features(dossier: dict):
             "evidence": list(dict.fromkeys([case_lid, window_lid]))
         }
 
-    # 4. Send Approved Notice (strictly with trusted approval)
+    # 4. Send Approved Notice
     if has_approval and approval_lid:
         return {
             "dossierId": dossier_id,
@@ -128,16 +133,16 @@ def extract_dossier_features(dossier: dict):
             "evidence": list(dict.fromkeys([approval_lid, ref_lid, email_lid]))
         }
 
-    # 5. Request Confirmation (identity ambiguity or conflict)
+    # 5. Request Confirmation
     full_str = " ".join(t for _, t, _, _ in all_lines).lower()
     if any(k in full_str for k in ["sender mismatch", "conflicting identity", "unverified sender", "address mismatch"]):
         return {
             "dossierId": dossier_id,
             "callId": call_id,
             "action": "request_confirmation",
-            "target": {"kind": "approval_queue", "id": "support"},
+            "target": {"kind": "approval_queue", "id": team_name},
             "payload": {"claimedSender": email_val, "questionCode": "VERIFY_REQUEST", "referenceId": ref_id},
-            "evidence": list(dict.fromkeys([ref_lid, email_lid]))
+            "evidence": list(dict.fromkeys([team_lid, ref_lid, email_lid]))
         }
 
     # 6. Default Customer Order Draft
@@ -194,7 +199,7 @@ async def mailroom_entrypoint(request: Request):
                 p = json.loads(cached[0][0])
                 proposals.append(p)
             else:
-                p = extract_dossier_features(d)
+                p = evaluate_dossier(d)
                 q("INSERT OR REPLACE INTO cache (k, v) VALUES (?,?)", (dk, json.dumps(p)))
                 proposals.append(p)
 
