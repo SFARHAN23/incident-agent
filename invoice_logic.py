@@ -135,9 +135,14 @@ def extract_package_decision(pkg: Dict[str, Any], policy_rev: str = "v1") -> Dic
         elif "material order/invoice difference" in comb_low or "conflicts with" in comb_low or "reconciliation tolerance" in comb_low:
             action = "open_exception"
         elif "named approver is required" in comb_low or "delegation ceiling" in comb_low or "ceiling" in comb_low:
-            m_ceil = re.search(r"ceiling for [A-Z]{3} is [A-Z]{3} ([\d\.]+)", controlling_text)
-            m_tot = re.search(r"(?:signed for|invoice total is|disbursement for) [A-Z]{3} ([\d\.]+)", controlling_text)
-            action = "request_approval" if (m_ceil and m_tot and float(m_tot.group(1)) > float(m_ceil.group(1))) else "settle_invoice"
+            m_ceil = re.search(r"ceiling for [A-Z]{3} is [A-Z]{3} ([\d,.]+)", controlling_text)
+            m_tot = re.search(r"(?:signed for|invoice total is|disbursement for) [A-Z]{3} ([\d,.]+)", controlling_text)
+            if m_ceil and m_tot:
+                ceil_val = float(re.sub(r"[^\d.]", "", m_ceil.group(1)))
+                tot_val = float(re.sub(r"[^\d.]", "", m_tot.group(1)))
+                action = "request_approval" if tot_val > ceil_val else "settle_invoice"
+            else:
+                action = "request_approval"
         else:
             action = "settle_invoice"
     else:  # style_b
