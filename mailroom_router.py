@@ -44,7 +44,7 @@ def evaluate_dossier(dossier: dict) -> dict:
             txt = line.get("text", "")
             all_lines.append((lid, txt, sid, prov, is_internal))
 
-            # Strictly enforce that only INTERNAL sources can authorize outbound notices
+            # Strictly enforce that ONLY internal sources can authorize outbound notices
             if is_internal:
                 low = txt.lower()
                 if any(k in low for k in ["approved for delivery notice", "explicit approval granted", "approved outbound send", "delivery notice approved"]):
@@ -67,7 +67,6 @@ def evaluate_dossier(dossier: dict) -> dict:
                 "evidence": [lid]
             }
 
-    # Extract case identifiers and sanitize against canary leaks
     ref_id = None
     ref_lid = None
     case_id = None
