@@ -49,6 +49,7 @@ def get_task(tid: str, request: Request):
     return reply(json.loads(rows[0][0])) if rows else err(404, "NOT_FOUND")
 
 @router.post("/tasks/{tid}:cancel")
+@router.post("/tasks/{tid}%3Acancel")
 def cancel_task(tid: str, request: Request):
     p, bad = gate(request)
     if bad: return bad
