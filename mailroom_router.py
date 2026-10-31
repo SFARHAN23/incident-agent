@@ -1,15 +1,10 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 import json, hashlib, base64, re, os
-import httpx
 from database import q, tx
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 router = APIRouter()
-
-LLM_URL = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
-LLM_KEY = os.environ.get("LLM_KEY", os.environ.get("GEMINI_API_KEY", "")).strip()
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
 
 def canon(x) -> str:
     return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -54,12 +49,10 @@ def extract_dossier_features(dossier: dict):
                 "evidence": [lid]
             }
 
-    # Extract precise case entities and lines
     ref_id, ref_lid = "REF-1001", all_lines[0][0] if all_lines else "l1"
     email_val, email_lid = "customer@example.com", all_lines[0][0] if all_lines else "l1"
     window_val, window_lid = "14:00-18:00", all_lines[0][0] if all_lines else "l1"
     case_id, case_lid = "CASE-1001", all_lines[0][0] if all_lines else "l1"
-    status_val = "PENDING"
     has_approval = False
     approval_lid = None
     is_completed_or_dup = False
@@ -77,7 +70,7 @@ def extract_dossier_features(dossier: dict):
             case_id, case_lid = cm.group(1).upper(), lid
 
         em = re.search(r"\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b", txt)
-        if em and "@example" in em.group(1).lower() or em and "customer" in em.group(1).lower() or em and "user" in em.group(1).lower():
+        if em:
             email_val, email_lid = em.group(1), lid
 
         wm = re.search(r"\b(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})\b", txt)
@@ -157,8 +150,10 @@ def extract_dossier_features(dossier: dict):
         "evidence": list(dict.fromkeys([ref_lid, email_lid]))
     }
 
-@router.post("")
-@router.post("/")
+@router.post("/mailroom")
+@router.post("/mailroom/")
+@router.post("/mailroom/propose")
+@router.post("/mailroom/commit")
 @router.post("/propose")
 @router.post("/commit")
 async def mailroom_entrypoint(request: Request):
@@ -222,7 +217,7 @@ async def mailroom_entrypoint(request: Request):
     elif op == "commit":
         eval_row = q("SELECT verifier_jwk, input_digest, proposals_json FROM mailroom_evals WHERE eval_id=?", (eval_id,))
         if not eval_row:
-            return JSONResponse({"error": "Evaluation not found"}, status_code=404)
+            return JSONResponse({"error": "Evaluation not found"}, status_code=400)
 
         stored_jwk = json.loads(eval_row[0][0])
         stored_input_digest = eval_row[0][1]
@@ -235,7 +230,6 @@ async def mailroom_entrypoint(request: Request):
         if not isinstance(receipts, list):
             return JSONResponse({"error": "Missing receipts list"}, status_code=400)
 
-        # Atomic Validation: Receipt count, duplicates, and missing proposals
         proposal_map = {p["dossierId"]: p for p in stored_proposals}
         if len(receipts) != len(stored_proposals):
             return JSONResponse({"error": "Receipt count does not match proposals"}, status_code=400)
@@ -252,7 +246,6 @@ async def mailroom_entrypoint(request: Request):
             seen_dossiers.add(did)
             seen_calls.add(cid)
 
-        # Import Ed25519 public key
         try:
             x_b64 = stored_jwk["x"]
             x_b64 += "=" * ((4 - len(x_b64) % 4) % 4)
@@ -263,7 +256,6 @@ async def mailroom_entrypoint(request: Request):
 
         outcomes = []
         for r in receipts:
-            # 1. Verify Signature
             sig_b64 = r.get("receiptSignature", "")
             if not sig_b64:
                 return JSONResponse({"error": "Missing receipt signature"}, status_code=400)
@@ -286,7 +278,6 @@ async def mailroom_entrypoint(request: Request):
             except Exception:
                 return JSONResponse({"error": "Invalid Ed25519 receipt signature"}, status_code=400)
 
-            # 2. Verify Scoped Binding
             prop = proposal_map.get(r["dossierId"])
             if not prop or prop["callId"] != r["callId"] or prop["action"] != r["action"]:
                 return JSONResponse({"error": "Receipt binding mismatch"}, status_code=400)
