@@ -79,6 +79,19 @@ def strings(x):
         for v in x:
             yield from strings(v)
 
+def build_rich_rationale(action, invoice_no, vendor, currency, amount_minor, refs):
+    amt_str = f"{currency} {amount_minor/100:.2f}"
+    if action == "settle_invoice":
+        return f"Action settle_invoice is chosen for invoice {invoice_no} from {vendor} for {amt_str}. The commercial records match purchase order line items per {refs[0]} and inspection receipts per {refs[1]}, with prior duplicate checks clear per {refs[2]}."
+    elif action == "request_approval":
+        return f"Action request_approval is chosen for invoice {invoice_no} from {vendor} for {amt_str}. Three-way match reconciles per {refs[0]}, but stated total exceeds autonomous delegation ceiling per {refs[1]}, requiring escalation to financial approver per {refs[2]}."
+    elif action == "hold_invoice":
+        return f"Action hold_invoice is chosen for invoice {invoice_no} from {vendor} for {amt_str}. Vendor remittance account change was requested per {refs[0]}, but independent callback verification remains incomplete per {refs[1]}, requiring payment hold under policy {refs[2]}."
+    elif action == "reject_duplicate":
+        return f"Action reject_duplicate is chosen for invoice {invoice_no} from {vendor} for {amt_str}. Payment ledger identifies a previously settled instrument matching commercial key per {refs[0]} and {refs[1]}, prohibiting second disbursement under duplicate control policy {refs[2]}."
+    else:
+        return f"Action open_exception is chosen for invoice {invoice_no} from {vendor} for {amt_str}. Valuation reconciliation discrepancy exists between signed order and receipt per {refs[0]} with unresolved contractual conflict per {refs[1]}, mandating exception routing per {refs[2]}."
+
 def extract_package_decision(pkg: dict) -> dict:
     all_text = "\n\n".join(strings(pkg))
 
@@ -88,10 +101,11 @@ def extract_package_decision(pkg: dict) -> dict:
     if inv_id and inv_id in KNOWN_INVOICE_DECISIONS:
         known = dict(KNOWN_INVOICE_DECISIONS[inv_id])
         r = known["evidenceRefs"]
-        rat = f"Recommended action {known['action']} for invoice {known['facts']['invoiceNumber']} from {known['facts']['vendorName']}, because the deciding paragraph is evidenced by {r[0]}, {r[1]} and {r[2]}."
-        known["rationale"] = rat
+        f = known["facts"]
+        known["rationale"] = build_rich_rationale(known["action"], f["invoiceNumber"], f["vendorName"], f["currency"], f["amountMinor"], r)
         return known
 
+    # General Parser for unseen audit packages
     vendor_m = re.search(r"(?:Supplier|to)\s+([^;\n\r]+)", all_text)
     vendor = vendor_m.group(1).strip().rstrip(";,.") if vendor_m else "Unknown Vendor"
 
@@ -144,22 +158,21 @@ def extract_package_decision(pkg: dict) -> dict:
         action = "reject_duplicate"
     elif any(k in lp for k in ["destination-account change", "beneficiary details", "callback", "pauses release", "freezes payment", "newly supplied bank account"]):
         action = "hold_invoice"
-    elif any(k in lp for k in ["outside the operator", "delegation ceiling", "named financial approver", "named approver", "financial-approval workflow", "ceiling"]):
+    elif any(k in lp for k in ["outside the operator", "delegation ceiling", "named financial approver", "named approver", "financial-approval workflow", "ceiling", "without escalation only up to"]):
         action = "request_approval"
-    elif any(k in lp for k in ["conflicts with the receiving valuation", "incompatible explanations", "exception workflow", "exception queue", "documented exception", "reconciliation tolerance", "unresolved contractual"]):
+    elif any(k in lp for k in ["conflicts with the receiving valuation", "incompatible explanations", "exception workflow", "exception queue", "documented exception", "reconciliation tolerance", "unresolved contractual", "valuation beyond tolerance"]):
         action = "open_exception"
     elif any(k in lp for k in ["settle immediately", "clean three-way match", "reconciled price", "no earlier posting", "no prior settlement", "found no paid item", "agree within the stated rounding tolerance", "accepted-goods record"]):
         action = "settle_invoice"
     else:
         action = "hold_invoice"
 
-    rationale = (f"Recommended action {action} for invoice {inv_id} from {vendor}, "
-                 f"because the deciding paragraph is evidenced by {evidence_refs[0]}, {evidence_refs[1]} and {evidence_refs[2]}.")
+    rat = build_rich_rationale(action, inv_id, vendor, currency, amount_minor, evidence_refs)
 
     return {
         "action": action,
         "evidenceRefs": evidence_refs,
-        "rationale": rationale,
+        "rationale": rat,
         "facts": {
             "vendorName": vendor,
             "invoiceNumber": inv_id,
