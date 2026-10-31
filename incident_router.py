@@ -18,10 +18,6 @@ def canon(x) -> str:
 def nano(offset_ms=0) -> str:
     return str(int((time.time() * 1000 + offset_ms) * 1e6))
 
-# ---------------------------------------------------------------------------
-# Decoy Stripper & Preprocessor
-# ---------------------------------------------------------------------------
-
 DECOY_PHRASES = [
     "operations handbook says", "referenced office was", "audit export sequence was",
     "timestamps are stored in utc", "service desk displays", "training material",
@@ -34,14 +30,10 @@ DECOY_PHRASES = [
 ]
 
 def extract_clean_evidence(transcript: str):
-    """
-    Strips 90%+ synthetic decoy filler lines and keeps only substantive evidence lines.
-    """
     clean_lines = []
     for line in transcript.split("\n"):
         line_clean = line.strip()
-        if not line_clean:
-            continue
+        if not line_clean: continue
         m = re.match(r"^\[([A-Za-z0-9_\-.:#]+)\]\s*(.*)", line_clean)
         if m:
             ev_id = m.group(1).strip()
@@ -59,40 +51,28 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
     max_diag = min(policy.get("maximumDiagnostics", 2), len(diag_tools))
 
     clean_ev = extract_clean_evidence(transcript)
-    if not clean_ev:
-        # Fallback to any bracketed line if filter was too aggressive
+    if len(clean_ev) < 2:
         for line in transcript.split("\n"):
             m = re.match(r"^\[([A-Za-z0-9_\-.:#]+)\]\s*(.*)", line.strip())
-            if m:
-                clean_ev.append((m.group(1).strip(), m.group(2).strip()))
+            if m: clean_ev.append((m.group(1).strip(), m.group(2).strip()))
 
-    chosen_model = "gemini-1.5-flash"
+    chosen_model = "gemini-2.5-flash"
 
-    # 1. Fast LLM Call on compact clean evidence (< 500 tokens, executes in ~0.8s)
+    # Fast AI Planning Call if key exists
     if LLM_KEY and clean_ev:
-        models = [os.environ.get("LLM_MODEL", "").strip(), "gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]
-        models = [m for m in models if m]
+        candidate_models = [os.environ.get("LLM_MODEL", "").strip(), "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        candidate_models = [m for m in candidate_models if m]
 
         prompt_payload = {
             "service": service,
             "title": incident_data.get("title", ""),
             "allowedRootCauses": allowed_roots,
-            "evidence": [{"id": cid, "text": ctxt} for cid, ctxt in clean_ev[:15]],
+            "evidence": [{"id": cid, "text": ctxt[:140]} for cid, ctxt in clean_ev[:25]],
             "availableDiagnostics": [{"name": t.get("name"), "description": t.get("description"), "inputSchema": t.get("inputSchema")} for t in diag_tools],
             "availableEffects": [{"name": t.get("name"), "inputSchema": t.get("inputSchema")} for t in tool_catalog if t.get("name") in effect_tools]
         }
 
-        system_msg = (
-            "You are an expert SRE incident responder. Given the evidence and tools:\n"
-            "1. Choose EXACTLY ONE root cause from `allowedRootCauses`.\n"
-            "2. Cite between 2 and 4 evidence IDs from `evidence`.\n"
-            "3. Select 1 or 2 strictly necessary diagnostic tools with arguments matching their inputSchema from the evidence.\n"
-            "4. Choose 1 remediating effect tool from `availableEffects` with arguments.\n"
-            "Respond strictly in JSON:\n"
-            "{\"rootCause\":\"...\", \"evidence\":[\"...\"], \"diagnostics\":[{\"toolName\":\"...\", \"arguments\":{...}}], \"effectTool\":\"...\", \"effectArgs\":{...}}"
-        )
-
-        for mod in models:
+        for mod in candidate_models:
             try:
                 res = httpx.post(
                     LLM_URL,
@@ -101,7 +81,7 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
                         "temperature": 0,
                         "response_format": {"type": "json_object"},
                         "messages": [
-                            {"role": "system", "content": system_msg},
+                            {"role": "system", "content": "Choose 1 root cause from `allowedRootCauses`, 2-4 exact IDs from `evidence`, 1 diagnostic tool, 1 effect tool. Return JSON: {\"rootCause\":\"...\", \"evidence\":[\"...\"], \"diagnostics\":[{\"toolName\":\"...\", \"arguments\":{...}}], \"effectTool\":\"...\", \"effectArguments\":{...}}"},
                             {"role": "user", "content": json.dumps(prompt_payload)}
                         ]
                     },
@@ -117,28 +97,26 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
                         chosen_model = mod
                         eff_name = out.get("effectTool")
                         eff_spec = next((t for t in tool_catalog if t.get("name") == eff_name), None)
-                        eff_args = out.get("effectArgs", {})
+                        eff_args = out.get("effectArguments", {})
                         return rc, ev_list[:4], diags[:max_diag], chosen_model, eff_spec, eff_args
             except Exception:
                 continue
 
-    # 2. Deterministic Fallback Guaranteed to Cite Real Transcript IDs
-    best_root = allowed_roots[0] if allowed_roots else "service_degradation"
+    # High-Precision Fallback
+    best_root = allowed_roots[0] if allowed_roots else "service_failure"
     best_score = -1
     matched_evs = []
 
     for root in allowed_roots:
         tokens = [t for t in re.split(r"[_\s\-]+", root.lower()) if len(t) > 2]
-        c_matches = [cid for cid, ctxt in clean_ev if any(tok in ctxt.lower() for tok in tokens)]
-        if len(c_matches) > best_score:
-            best_score = len(c_matches)
+        matches = [cid for cid, ctxt in clean_ev if any(tok in ctxt.lower() for tok in tokens)]
+        if len(matches) > best_score:
+            best_score = len(matches)
             best_root = root
-            matched_evs = c_matches
+            matched_evs = matches
 
-    if len(matched_evs) < 2:
-        matched_evs = [c[0] for c in clean_ev]
-    if len(matched_evs) < 2:
-        matched_evs = (matched_evs + ["ev_primary", "ev_secondary"])[:2]
+    if len(matched_evs) < 2: matched_evs = [c[0] for c in clean_ev]
+    if len(matched_evs) < 2: matched_evs = (matched_evs + [clean_ev[0][0], clean_ev[-1][0]])[:2]
     chosen_evidence = matched_evs[:3]
 
     root_tokens = set(re.split(r"[_\s\-]+", best_root.lower()))
@@ -153,7 +131,6 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
         args = build_args_for_tool(t, service, transcript)
         diag_dispatches.append({"toolName": t.get("name"), "arguments": args})
 
-    # Effect tool selection with scaling limit safety check
     transcript_low = transcript.lower()
     if any(k in transcript_low for k in ["scaling limit", "max replicas", "already at limit", "cannot scale"]) and "page_owner" in effect_tools:
         eff_name = "page_owner"
@@ -178,8 +155,7 @@ def build_args_for_tool(tool: dict, service: str, transcript: str) -> dict:
         low = p_name.lower()
         p_type = p_spec.get("type", "string")
 
-        if "service" in low:
-            args[p_name] = service
+        if "service" in low: args[p_name] = service
         elif "region" in low:
             m = re.search(r"\b(us-east-1|us-west-2|eu-west-1|ap-south-1)\b", transcript)
             args[p_name] = m.group(1) if m else "us-east-1"
@@ -192,27 +168,16 @@ def build_args_for_tool(tool: dict, service: str, transcript: str) -> dict:
         elif "metric" in low or "query" in low:
             m = re.search(r"\b(cpu[_\w]*|memory[_\w]*|error_rate|latency|request_count|db_pool[_\w]*)\b", transcript, re.I)
             args[p_name] = m.group(1) if m else "error_rate"
-        elif "cluster" in low:
-            args[p_name] = f"{service}-prod"
-        elif "namespace" in low or "env" in low:
-            args[p_name] = "production"
-        elif p_type == "integer":
-            args[p_name] = int(p_spec.get("default", 10))
-        elif p_type == "boolean":
-            args[p_name] = bool(p_spec.get("default", True))
-        elif p_type == "array":
-            args[p_name] = [service]
-        elif "enum" in p_spec:
-            args[p_name] = p_spec["enum"][0]
+        elif "cluster" in low: args[p_name] = f"{service}-prod"
+        elif "namespace" in low or "env" in low: args[p_name] = "production"
+        elif p_type == "integer": args[p_name] = int(p_spec.get("default", 10))
+        elif p_type == "boolean": args[p_name] = bool(p_spec.get("default", True))
+        elif p_type == "array": args[p_name] = [service]
+        elif "enum" in p_spec: args[p_name] = p_spec["enum"][0]
         else:
             m = re.search(r"\b([A-Za-z0-9_\-]{4,25})\b", transcript)
             args[p_name] = m.group(1) if m else service
-
     return args
-
-# ---------------------------------------------------------------------------
-# OTLP Trace Generator strictly matching the Specification Topology
-# ---------------------------------------------------------------------------
 
 def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, receipt_log, approval_log, num_diagnostics):
     server_span_id = sha(f"srv_{run_id}")[:16]
@@ -255,7 +220,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "endTimeUnixNano": nano(20),
             "attributes": common_attrs + [
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
-                {"key": "gen_ai.request.model", "value": {"stringValue": agent_model or "gemini-1.5-flash"}}
+                {"key": "gen_ai.request.model", "value": {"stringValue": agent_model or "gemini-2.5-flash"}}
             ]
         }
     ]
@@ -273,15 +238,14 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
         if action_id not in exec_span_map:
             exec_span_id = sha(f"exec_{action_id}")[:16]
             exec_span_map[action_id] = exec_span_id
-            if phase == "diagnostic":
-                diagnostic_exec_spans.append(exec_span_id)
+            if phase == "diagnostic": diagnostic_exec_spans.append(exec_span_id)
 
             spans.append({
                 "traceId": trace_id,
                 "spanId": exec_span_id,
                 "parentSpanId": agent_span_id,
                 "name": f"execute_tool {tool_name}",
-                "kind": 1,  # INTERNAL
+                "kind": 1,
                 "startTimeUnixNano": nano(22),
                 "endTimeUnixNano": nano(88),
                 "attributes": common_attrs + [
@@ -316,7 +280,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "spanId": client_span_id,
             "parentSpanId": exec_span_map[action_id],
             "name": f"POST tool/{tool_name}",
-            "kind": 3,  # CLIENT
+            "kind": 3,
             "startTimeUnixNano": nano(24 + (attempt - 1) * 15),
             "endTimeUnixNano": nano(40 + (attempt - 1) * 15),
             "attributes": span_attrs
@@ -333,7 +297,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
 
         spans.append(client_span)
 
-    # Required incident.join span when independent diagnostics fan out
+    # incident.join span linking diagnostic tool executions
     if num_diagnostics > 1 and len(diagnostic_exec_spans) > 1:
         join_span_id = sha(f"join_{run_id}")[:16]
         links = [{"traceId": trace_id, "spanId": sid, "attributes": common_attrs} for sid in diagnostic_exec_spans]
@@ -342,21 +306,21 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "spanId": join_span_id,
             "parentSpanId": agent_span_id,
             "name": "incident.join",
-            "kind": 1,  # INTERNAL
+            "kind": 1,
             "startTimeUnixNano": nano(50),
             "endTimeUnixNano": nano(55),
             "attributes": common_attrs,
             "links": links
         })
 
-    # Required approval_gate span when approval receipt occurred
+    # approval_gate span recording approval ID and nonce
     for a in approval_log:
         spans.append({
             "traceId": trace_id,
             "spanId": sha(f"appr_{a['approvalId']}")[:16],
             "parentSpanId": agent_span_id,
             "name": "approval_gate",
-            "kind": 1,  # INTERNAL
+            "kind": 1,
             "startTimeUnixNano": nano(58),
             "endTimeUnixNano": nano(64),
             "attributes": common_attrs + [
@@ -371,10 +335,6 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "scopeSpans": [{"scope": {"name": "ga5-incident-tracer", "version": "1.0"}, "spans": spans}]
         }]
     }
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
 
 @router.post("/v2/incidents")
 @router.post("/incident/v2/incidents")
@@ -509,7 +469,6 @@ async def handle_receipts(runId: str, request: Request):
         elif int(o.get("status", 200)) == 0 or o.get("errorType") == "timeout":
             has_timeout = True
 
-    # 1. 503 Retry Response
     if retry_dispatches:
         resp = {
             "runId": runId,
@@ -524,7 +483,6 @@ async def handle_receipts(runId: str, request: Request):
              (receipt_key, rh, json.dumps(resp)))])
         return JSONResponse(resp)
 
-    # 2. Timeout Suppression: Diagnostic failure suppresses dependent effect
     if has_timeout:
         trace = build_otlp_trace(runId, state["publicMarker"], state["traceId"], state["agentModel"],
                                  state["actionLog"], state["receiptLog"], state["approvalLog"], state.get("numDiagnostics", 1))
@@ -544,7 +502,6 @@ async def handle_receipts(runId: str, request: Request):
              (receipt_key, rh, json.dumps(resp)))])
         return JSONResponse(resp)
 
-    # 3. Handle Approval Receipt -> Dispatch Approved Effect
     if approvals_in:
         appr = approvals_in[0]
         state["approvalLog"].append(appr)
@@ -586,7 +543,6 @@ async def handle_receipts(runId: str, request: Request):
              (receipt_key, rh, json.dumps(resp)))])
         return JSONResponse(resp)
 
-    # 4. Check if Diagnostics Completed -> Request Approval or Dispatch Direct Effect
     chosen_effect_tool = state.get("chosenEffectTool", {"name": "rollback_deployment"})
     effect_name = chosen_effect_tool.get("name", "rollback_deployment")
     appr_required = state["policy"].get("approvalRequiredFor", [])
@@ -647,7 +603,6 @@ async def handle_receipts(runId: str, request: Request):
                  (receipt_key, rh, json.dumps(resp)))])
             return JSONResponse(resp)
 
-    # 5. Terminal Completion
     trace = build_otlp_trace(runId, state["publicMarker"], state["traceId"], state["agentModel"],
                              state["actionLog"], state["receiptLog"], state["approvalLog"], state.get("numDiagnostics", 1))
 
