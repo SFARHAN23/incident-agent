@@ -21,6 +21,14 @@ def now(): return datetime.now(timezone.utc).isoformat()
 def reply(obj, status=200): return Response(json.dumps(obj, ensure_ascii=False).encode("utf-8"), status_code=status, media_type=MT)
 def err(status, code): return reply({"error": {"code": code, "message": "Request could not be processed."}}, status)
 
+def compact_message_for_history(msg: dict) -> dict:
+    m_copy = json.loads(json.dumps(msg))
+    for p in m_copy.get("parts", []):
+        if p.get("mediaType") == BATCH_MT:
+            pkgs = p.get("data", {}).get("packages", [])
+            p["data"]["packages"] = [{"packageId": pkg.get("packageId") or pkg.get("id")} for pkg in pkgs]
+    return m_copy
+
 def gate(request: Request, need_json=False):
     h = request.headers.get("authorization", "")
     tok = h[7:].strip() if h.startswith("Bearer ") else ""
@@ -129,7 +137,7 @@ def handle_initial(p, msg, mid, h):
             "name": "invoice-action-proposals",
             "parts": [{"mediaType": PROP_MT, "data": {"batchId": batch_id, "proposals": proposals}}]
         }],
-        "history": [{**msg, "taskId": tid, "contextId": cid}]
+        "history": [{**compact_message_for_history(msg), "taskId": tid, "contextId": cid}]
     }
     tx([("INSERT INTO tasks VALUES (?,?,?)", (tid, p, json.dumps(task))),
         ("INSERT INTO msgs VALUES (?,?,?,?,?)", (p, mid, h, tid, time.time()))])
@@ -187,7 +195,7 @@ def handle_continuation(p, msg, mid, h):
             "mediaType": REC_MT,
             "data": {"batchId": prop_data["batchId"], "executions": executions}
         })
-        t["history"].append(msg)
+        t["history"].append(compact_message_for_history(msg))
         t["status"] = {"state": DONE, "timestamp": now()}
         tx([("UPDATE tasks SET body=? WHERE id=? AND principal=?", (json.dumps(t), tid, p)),
             ("INSERT INTO msgs VALUES (?,?,?,?,?)", (p, mid, h, tid, time.time()))])
