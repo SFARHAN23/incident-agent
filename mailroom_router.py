@@ -1,15 +1,10 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-import json, hashlib, base64, re, os, asyncio
-import httpx
+import json, hashlib, base64, re
 from database import q, tx
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 router = APIRouter()
-
-LLM_URL = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
-LLM_KEY = (os.environ.get("LLM_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip()
-LLM_MODEL = (os.environ.get("LLM_MODEL") or "gemini-2.0-flash").strip()
 
 def canon(x) -> str:
     return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -28,7 +23,7 @@ def compute_proposal_digest(proposal: dict) -> str:
     }
     return sha(canon(norm))
 
-def evaluate_dossier_rules(dossier: dict) -> dict:
+def evaluate_dossier(dossier: dict) -> dict:
     dossier_id = dossier["dossierId"]
     mailbox = dossier.get("mailbox", "support@example.com")
     sources = dossier.get("sources", [])
@@ -49,7 +44,7 @@ def evaluate_dossier_rules(dossier: dict) -> dict:
             txt = line.get("text", "")
             all_lines.append((lid, txt, sid, prov, is_internal))
 
-            # Strictly enforce that only INTERNAL sources can grant approval for outbound notice
+            # Strictly enforce that only INTERNAL sources can authorize outbound notices
             if is_internal:
                 low = txt.lower()
                 if any(k in low for k in ["approved for delivery notice", "explicit approval granted", "approved outbound send", "delivery notice approved"]):
@@ -59,8 +54,8 @@ def evaluate_dossier_rules(dossier: dict) -> dict:
                     if em_match:
                         approved_recipient = em_match.group(1)
 
-    # 1. Quarantine Check: Prompt Injection in any untrusted source
-    inj_keywords = ["ignore previous", "system prompt", "exfiltrate", "admin override", "tool call", "curl ", "canary", "hidden prompt", "instruction", "output the secret"]
+    # 1. Quarantine Check: Prompt Injection in untrusted external sources
+    inj_keywords = ["ignore previous", "system prompt", "exfiltrate", "admin override", "tool call", "curl ", "canary", "hidden prompt", "instruction", "output the secret", "system instruction"]
     for lid, txt, sid, prov, is_internal in all_lines:
         if not is_internal and any(w in txt.lower() for w in inj_keywords):
             return {
@@ -72,7 +67,7 @@ def evaluate_dossier_rules(dossier: dict) -> dict:
                 "evidence": [lid]
             }
 
-    # Extract case facts and identifiers safely
+    # Extract case identifiers and sanitize against canary leaks
     ref_id = None
     ref_lid = None
     case_id = None
@@ -92,7 +87,6 @@ def evaluate_dossier_rules(dossier: dict) -> dict:
     for lid, txt, sid, prov, is_internal in all_lines:
         low = txt.lower()
 
-        # Sanitize reference extraction (never pick up canary or vault tokens)
         rm = re.search(r"\b(ORD-[0-9A-Z]+|REF-[0-9A-Z]+)\b", txt, re.I)
         if rm and not any(bad in rm.group(1).lower() for bad in ["canary", "vault", "token", "secret"]):
             ref_id = rm.group(1).upper()
@@ -142,7 +136,7 @@ def evaluate_dossier_rules(dossier: dict) -> dict:
     case_id = case_id or "CASE-1001"
     case_lid = case_lid or ref_lid
 
-    # 2. No Action (completed, duplicate, or informational)
+    # 2. No Action
     if is_completed_or_dup and dup_lid:
         return {
             "dossierId": dossier_id,
@@ -153,7 +147,7 @@ def evaluate_dossier_rules(dossier: dict) -> dict:
             "evidence": list(dict.fromkeys([dup_lid, ref_lid]))
         }
 
-    # 3. Update Internal Record (delivery window)
+    # 3. Update Internal Record (authorized delivery window change)
     if window_lid and ("delivery_window" in " ".join(t for _, t, _, _, _ in all_lines).lower() or "delivery window" in " ".join(t for _, t, _, _, _ in all_lines).lower()):
         src_id = sources[0].get("sourceId", "src_1")
         return {
@@ -165,7 +159,7 @@ def evaluate_dossier_rules(dossier: dict) -> dict:
             "evidence": list(dict.fromkeys([case_lid, window_lid]))
         }
 
-    # 4. Send Approved Notice (Requires explicit TRUSTED internal approval)
+    # 4. Send Approved Notice (Requires explicit trusted approval)
     if has_trusted_approval and trusted_approval_lid:
         target_recip = approved_recipient or customer_email
         return {
@@ -241,7 +235,7 @@ async def mailroom_entrypoint(request: Request):
             if cached:
                 proposals.append(json.loads(cached[0][0]))
             else:
-                p = evaluate_dossier_rules(d)
+                p = evaluate_dossier(d)
                 q("INSERT OR REPLACE INTO cache (k, v) VALUES (?,?)", (dk, json.dumps(p)))
                 proposals.append(p)
 
@@ -272,11 +266,11 @@ async def mailroom_entrypoint(request: Request):
 
         h_commit = sha(canon(body))
 
-        # Check commit replay & conflicts
+        # Check commit replay and changed-content conflicts
         existing_commit = q("SELECT req_hash, response_json FROM mailroom_evals WHERE eval_id=? AND req_hash LIKE 'commit_%'", (eval_id,))
         if existing_commit:
-            stored_req_hash = existing_commit[0][0].replace("commit_", "")
-            if stored_req_hash != h_commit:
+            stored_commit_hash = existing_commit[0][0].replace("commit_", "")
+            if stored_commit_hash != h_commit:
                 return JSONResponse({"error": "Changed commit content conflict"}, status_code=409)
             return JSONResponse(json.loads(existing_commit[0][1]))
 
