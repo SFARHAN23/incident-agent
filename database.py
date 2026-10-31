@@ -1,6 +1,6 @@
 import sqlite3, threading, json, os, time
 
-DB_FILE = os.environ.get("DB_PATH", "agents_v5.db")
+DB_FILE = os.environ.get("DB_PATH", "agents_v6.db")
 db_lock = threading.RLock()
 _locks, _master = {}, threading.Lock()
 
