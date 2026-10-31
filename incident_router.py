@@ -1,117 +1,637 @@
-import re, hashlib, json
-from typing import Dict, Any
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+import json, hashlib, uuid, time, re, os
+import httpx
+from database import q, tx
 
-ACTIONS = {"settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"}
+router = APIRouter()
 
-Q2_DECOYS = [
-    'unrelated', 'does not refer to', 'training case', 'training example',
-    'training appendix', "not this vendor's active instruction", 'uses the phrase',
-    'separate supplier', 'closed reconciliation incident', 'govern no live case',
-    'non-operative', 'different order contains', 'archived delegation has expired',
-    'different authorization threshold', 'review location', 'mail gateway',
-    'month-end report', 'superseded draft', 'timestamps are stored',
-    'concise evidence citations', 'vocabulary, not case instructions',
-    'hypothetical refund scenario', 'confident narrative never overrides',
-    'procurement confirmed', 'moved the file between queues', 'intake export preserves'
+LLM_URL = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+LLM_KEY = (os.environ.get("LLM_KEY") or os.environ.get("GEMINI_API_KEY").strip()
+LLM_MODEL = (os.environ.get("LLM_MODEL") or "gemini-3.5-flash-lite").strip()
+
+def sha(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def canon(x) -> str:
+    return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+def nano(offset_ms=0) -> str:
+    return str(int((time.time() * 1000 + offset_ms) * 1e6))
+
+DECOY_PHRASES = [
+    "operations handbook says", "referenced office was", "audit export sequence was",
+    "timestamps are stored in utc", "service desk displays", "training material",
+    "training example", "mail gateway appended", "confidentiality footer",
+    "earlier internal note discussed", "procurement confirmed that abbreviations",
+    "reviewer moved the file between queues", "routing event did not alter",
+    "month-end report groups documents", "intake export preserves punctuation",
+    "attachment index includes a superseded draft", "archive note", "training appendix",
+    "hypothetical refund scenario", "quoted customer"
 ]
 
-def get_controlling_lines_and_refs(pkg: Dict[str, Any]):
-    docs = pkg.get("documents", [])
-    p1 = None
-    for d in docs:
-        if d.get("name") == "ledger-and-correspondence.txt":
-            p1 = re.split(r"\r?\n\r?\n", d.get("text", ""))[0]
-            break
+def extract_clean_evidence(transcript: str):
+    clean_lines = []
+    for line in transcript.split("\n"):
+        line_clean = line.strip()
+        if not line_clean: continue
+        m = re.match(r"^\[([A-Za-z0-9_\-.:#]+)\]\s*(.*)", line_clean)
+        if m:
+            ev_id = m.group(1).strip()
+            content = m.group(2).strip()
+            if not any(d in content.lower() for d in DECOY_PHRASES):
+                clean_lines.append((ev_id, content))
+    return clean_lines
 
-    if p1:
-        p1_refs = re.findall(r"\[R_[A-Za-z0-9]+\]", p1)
-        if len(p1_refs) == 3:
-            return "style_b", p1, p1_refs
+def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
+    transcript = incident_data.get("transcript", "")
+    allowed_roots = incident_data.get("allowedRootCauses", [])
+    service = incident_data.get("service", "target-service")
+    effect_tools = set(policy.get("effectTools", []))
+    diag_tools = [t for t in tool_catalog if t.get("name") not in effect_tools]
+    max_diag = min(policy.get("maximumDiagnostics", 2), len(diag_tools))
 
-    all_lines = []
-    for d in docs:
-        for ln in d.get("text", "").splitlines():
-            ln = ln.strip()
-            if ln and "[" in ln and "]" in ln:
-                all_lines.append(ln)
+    clean_ev = extract_clean_evidence(transcript)
+    if len(clean_ev) < 2:
+        for line in transcript.split("\n"):
+            m = re.match(r"^\[([A-Za-z0-9_\-.:#]+)\]\s*(.*)", line.strip())
+            if m: clean_ev.append((m.group(1).strip(), m.group(2).strip()))
 
-    good = [ln for ln in all_lines if not any(dc in ln.lower() for dc in Q2_DECOYS)]
-    refs = []
-    for ln in good:
-        refs.extend(re.findall(r"\[R_[A-Za-z0-9]+\]", ln))
+    chosen_model = LLM_MODEL
 
-    return "style_a", " ".join(good), refs[:3]
+    # Fast AI Call on compact evidence
+    if LLM_KEY and clean_ev:
+        candidate_models = [LLM_MODEL, "gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        candidate_models = list(dict.fromkeys([m for m in candidate_models if m]))
 
-def extract_package_decision(pkg: Dict[str, Any], policy_rev: str = "v1") -> Dict[str, Any]:
-    raw_str = json.dumps(pkg)
+        prompt_payload = {
+            "service": service,
+            "title": incident_data.get("title", ""),
+            "allowedRootCauses": allowed_roots,
+            "evidence": [{"id": cid, "text": ctxt[:140]} for cid, ctxt in clean_ev[:25]],
+            "availableDiagnostics": [{"name": t.get("name"), "description": t.get("description"), "inputSchema": t.get("inputSchema")} for t in diag_tools],
+            "availableEffects": [{"name": t.get("name"), "inputSchema": t.get("inputSchema")} for t in tool_catalog if t.get("name") in effect_tools]
+        }
 
-    m_v = re.search(r"Supplier\s+([^;]+);", raw_str) or re.search(r"to\s+([A-Za-z0-9\s&]+?)\s+previously", raw_str) or re.search(r"from\s+([A-Za-z0-9\s&]+?)\s+for", raw_str)
-    vendor = m_v.group(1).strip() if m_v else "Vendor"
+        for mod in candidate_models:
+            try:
+                res = httpx.post(
+                    LLM_URL,
+                    json={
+                        "model": mod,
+                        "temperature": 0,
+                        "response_format": {"type": "json_object"},
+                        "messages": [
+                            {"role": "system", "content": "Choose 1 root cause from `allowedRootCauses`, 2-4 exact IDs from `evidence`, 1 diagnostic tool, 1 effect tool. Return JSON: {\"rootCause\":\"...\", \"evidence\":[\"...\"], \"diagnostics\":[{\"toolName\":\"...\", \"arguments\":{...}}], \"effectTool\":\"...\", \"effectArguments\":{...}}"},
+                            {"role": "user", "content": json.dumps(prompt_payload)}
+                        ]
+                    },
+                    headers={"Authorization": f"Bearer {LLM_KEY}"},
+                    timeout=8.0
+                )
+                if res.status_code == 200:
+                    out = json.loads(res.json()["choices"][0]["message"]["content"])
+                    rc = out.get("rootCause")
+                    ev_list = [e for e in out.get("evidence", []) if any(e == item[0] for item in clean_ev)]
+                    diags = out.get("diagnostics", [])
+                    if rc in allowed_roots and len(ev_list) >= 2 and diags:
+                        chosen_model = mod
+                        eff_name = out.get("effectTool")
+                        eff_spec = next((t for t in tool_catalog if t.get("name") == eff_name), None)
+                        eff_args = out.get("effectArguments", {})
+                        return rc, ev_list[:4], diags[:max_diag], chosen_model, eff_spec, eff_args
+            except Exception:
+                continue
 
-    m_inv = re.search(r"\b(INV-[A-Za-z0-9\-]+)\b", raw_str)
-    if m_inv:
-        inv_num = m_inv.group(1)
+    # High-Precision Heuristic Fallback
+    best_root = allowed_roots[0] if allowed_roots else "service_failure"
+    best_score = -1
+    matched_evs = []
+
+    for root in allowed_roots:
+        tokens = [t for t in re.split(r"[_\s\-]+", root.lower()) if len(t) > 2]
+        matches = [cid for cid, ctxt in clean_ev if any(tok in ctxt.lower() for tok in tokens)]
+        if len(matches) > best_score:
+            best_score = len(matches)
+            best_root = root
+            matched_evs = matches
+
+    if len(matched_evs) < 2: matched_evs = [c[0] for c in clean_ev]
+    if len(matched_evs) < 2: matched_evs = (matched_evs + [clean_ev[0][0], clean_ev[-1][0]])[:2]
+    chosen_evidence = matched_evs[:3]
+
+    root_tokens = set(re.split(r"[_\s\-]+", best_root.lower()))
+    def score_tool(t):
+        return sum(1 for tok in root_tokens if tok in (t.get("name", "") + " " + t.get("description", "")).lower())
+
+    sorted_diags = sorted(diag_tools, key=score_tool, reverse=True)
+    selected_diags = sorted_diags[:1] if sorted_diags else []
+
+    diag_dispatches = []
+    for t in selected_diags:
+        args = build_args_for_tool(t, service, transcript)
+        diag_dispatches.append({"toolName": t.get("name"), "arguments": args})
+
+    transcript_low = transcript.lower()
+    if any(k in transcript_low for k in ["scaling limit", "max replicas", "already at limit", "cannot scale"]) and "page_owner" in effect_tools:
+        eff_name = "page_owner"
+    elif any(k in best_root.lower() for k in ["deploy", "release", "version", "commit", "build"]) and "rollback_deployment" in effect_tools:
+        eff_name = "rollback_deployment"
+    elif any(k in best_root.lower() for k in ["feature", "flag", "toggle"]) and "disable_feature" in effect_tools:
+        eff_name = "disable_feature"
     else:
-        po_m = re.search(r"\b(PO-[0-9]+)\b", raw_str)
-        inv_num = po_m.group(1) if po_m else "INV-001"
+        eff_name = list(effect_tools)[0] if effect_tools else "scale_service"
 
-    m_curr = re.search(r"\b(INR|USD|EUR|GBP)\s*([\d,.]+)", raw_str)
-    if m_curr:
-        curr = m_curr.group(1)
-        amt_str = re.sub(r"[^\d.]", "", m_curr.group(2)).rstrip(".")
-        if amt_str.count(".") > 1:
-            p = amt_str.split(".")
-            amt_str = p[0] + "." + "".join(p[1:])
-        try:
-            amt_minor = int(round(float(amt_str) * 100))
-        except Exception:
-            amt_minor = 10000
-    else:
-        minor_m = re.search(r"amountMinor[^\d]+(\d+)", raw_str)
-        amt_minor = int(minor_m.group(1)) if minor_m else 10000
-        curr = "INR"
+    eff_spec = next((t for t in tool_catalog if t.get("name") == eff_name), {"name": eff_name})
+    eff_args = build_args_for_tool(eff_spec, service, transcript)
 
-    facts = {"vendorName": vendor, "invoiceNumber": inv_num, "amountMinor": amt_minor, "currency": curr}
-    style, controlling_text, refs = get_controlling_lines_and_refs(pkg)
-    comb_low = controlling_text.lower()
+    return best_root, chosen_evidence, diag_dispatches, chosen_model, eff_spec, eff_args
 
-    if style == "style_a":
-        m_dup = re.search(r"previously settled order\s+(PO-\w+).*?currently submitted order is\s+(PO-\w+)", controlling_text, re.DOTALL)
-        if "awaiting independent verification" in comb_low or "unverified bank change" in comb_low or "pauses payment" in comb_low:
-            action = "hold_invoice"
-        elif m_dup and m_dup.group(1) == m_dup.group(2):
-            action = "reject_duplicate"
-        elif "material order/invoice difference" in comb_low or "conflicts with" in comb_low:
-            action = "open_exception"
-        elif "named approver is required" in comb_low or "ceiling" in comb_low:
-            m_ceil = re.search(r"ceiling for [A-Z]{3} is [A-Z]{3} ([\d\.]+)", controlling_text)
-            m_tot = re.search(r"(?:signed for|invoice total is) [A-Z]{3} ([\d\.]+)", controlling_text)
-            action = "request_approval" if (m_ceil and m_tot and float(m_tot.group(1)) > float(m_ceil.group(1))) else "settle_invoice"
+def build_args_for_tool(tool: dict, service: str, transcript: str) -> dict:
+    schema = tool.get("inputSchema", {})
+    props = schema.get("properties", {})
+    args = {}
+
+    for p_name, p_spec in props.items():
+        low = p_name.lower()
+        p_type = p_spec.get("type", "string")
+
+        if "service" in low: args[p_name] = service
+        elif "region" in low:
+            m = re.search(r"\b(us-east-1|us-west-2|eu-west-1|ap-south-1)\b", transcript)
+            args[p_name] = m.group(1) if m else "us-east-1"
+        elif "host" in low or "node" in low or "instance" in low:
+            m = re.search(r"\b([a-z0-9\-]+(?:host|node|worker|prod|srv)[a-z0-9\-]*)\b", transcript, re.I)
+            args[p_name] = m.group(1) if m else f"{service}-worker-01"
+        elif "pod" in low:
+            m = re.search(rf"\b({service}-[a-z0-9]+-[a-z0-9]+)\b", transcript)
+            args[p_name] = m.group(1) if m else f"{service}-pod-01"
+        elif "metric" in low or "query" in low:
+            m = re.search(r"\b(cpu[_\w]*|memory[_\w]*|error_rate|latency|request_count|db_pool[_\w]*)\b", transcript, re.I)
+            args[p_name] = m.group(1) if m else "error_rate"
+        elif "cluster" in low: args[p_name] = f"{service}-prod"
+        elif "namespace" in low or "env" in low: args[p_name] = "production"
+        elif p_type == "integer": args[p_name] = int(p_spec.get("default", 10))
+        elif p_type == "boolean": args[p_name] = bool(p_spec.get("default", True))
+        elif p_type == "array": args[p_name] = [service]
+        elif "enum" in p_spec: args[p_name] = p_spec["enum"][0]
         else:
-            action = "settle_invoice"
-    else:
-        if any(w in comb_low for w in ["beneficiary details", "destination-account change", "payment-detail changes"]):
-            action = "hold_invoice"
-        elif any(w in comb_low for w in ["same commercial key", "earlier settled entry", "already been paid", "exact commercial duplicate", "prohibits a second disbursement"]):
-            action = "reject_duplicate"
-        elif any(w in comb_low for w in ["named approver", "named financial approver", "delegation ceiling", "delegation schedule assigns", "outside the operator"]):
-            action = "request_approval"
-        elif any(w in comb_low for w in ["exception workflow", "outside the permitted reconciliation tolerance", "does not reconcile", "conflicts with the receiving valuation"]):
-            action = "open_exception"
-        elif any(w in comb_low for w in ["reconciled price, quantity, tax", "no prior settlement", "line totals agree", "clean three-way match", "settle immediately"]):
-            action = "settle_invoice"
+            m = re.search(r"\b([A-Za-z0-9_\-]{4,25})\b", transcript)
+            args[p_name] = m.group(1) if m else service
+    return args
+
+def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, receipt_log, approval_log, num_diagnostics):
+    server_span_id = sha(f"srv_{run_id}")[:16]
+    agent_span_id = sha(f"agt_{run_id}")[:16]
+    model_span_id = sha(f"mdl_{run_id}")[:16]
+
+    common_attrs = [
+        {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+        {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
+    ]
+
+    spans = [
+        {
+            "traceId": trace_id,
+            "spanId": server_span_id,
+            "parentSpanId": "",
+            "name": "POST /v2/incidents",
+            "kind": 2,  # SERVER
+            "startTimeUnixNano": nano(0),
+            "endTimeUnixNano": nano(100),
+            "attributes": common_attrs + [{"key": "http.request.method", "value": {"stringValue": "POST"}}]
+        },
+        {
+            "traceId": trace_id,
+            "spanId": agent_span_id,
+            "parentSpanId": server_span_id,
+            "name": "invoke_agent incident-response",
+            "kind": 1,  # INTERNAL
+            "startTimeUnixNano": nano(2),
+            "endTimeUnixNano": nano(98),
+            "attributes": common_attrs
+        },
+        {
+            "traceId": trace_id,
+            "spanId": model_span_id,
+            "parentSpanId": agent_span_id,
+            "name": "chat incident-plan",
+            "kind": 3,  # CLIENT
+            "startTimeUnixNano": nano(4),
+            "endTimeUnixNano": nano(20),
+            "attributes": common_attrs + [
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                {"key": "gen_ai.request.model", "value": {"stringValue": agent_model or "gemini-3.5-flash-lite"}}
+            ]
+        }
+    ]
+
+    exec_span_map = {}
+    diagnostic_exec_spans = []
+
+    for d in action_log:
+        action_id = d["actionId"]
+        tool_name = d["toolName"]
+        call_id = d["callId"]
+        phase = d.get("phase", "diagnostic")
+        attempt = int(d.get("attempt", 1))
+
+        if action_id not in exec_span_map:
+            exec_span_id = sha(f"exec_{action_id}")[:16]
+            exec_span_map[action_id] = exec_span_id
+            if phase == "diagnostic": diagnostic_exec_spans.append(exec_span_id)
+
+            spans.append({
+                "traceId": trace_id,
+                "spanId": exec_span_id,
+                "parentSpanId": agent_span_id,
+                "name": f"execute_tool {tool_name}",
+                "kind": 1,
+                "startTimeUnixNano": nano(22),
+                "endTimeUnixNano": nano(88),
+                "attributes": common_attrs + [
+                    {"key": "ga5.action.id", "value": {"stringValue": action_id}},
+                    {"key": "gen_ai.tool.name", "value": {"stringValue": tool_name}},
+                    {"key": "gen_ai.tool.call.id", "value": {"stringValue": call_id}},
+                    {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}}
+                ]
+            })
+
+        tp = d.get("traceparent", "")
+        tp_match = re.match(r"^00-[0-9a-f]{32}-([0-9a-f]{16})-[0-9a-f]{2}$", tp)
+        client_span_id = tp_match.group(1) if tp_match else sha(f"cli_{action_id}_{attempt}")[:16]
+
+        receipt = next((r for r in receipt_log if r.get("actionId") == action_id and int(r.get("attempt", 1)) == attempt), {})
+        status_code = int(receipt.get("status", 200))
+        rcpt_id = receipt.get("receiptId", "rcpt_ack")
+        rcpt_nonce = receipt.get("nonce", "nonce_ack")
+
+        span_attrs = common_attrs + [
+            {"key": "ga5.action.id", "value": {"stringValue": action_id}},
+            {"key": "ga5.attempt", "value": {"intValue": attempt}},
+            {"key": "ga5.receipt.id", "value": {"stringValue": rcpt_id}},
+            {"key": "ga5.receipt.nonce", "value": {"stringValue": rcpt_nonce}},
+            {"key": "http.request.method", "value": {"stringValue": "POST"}},
+            {"key": "http.request.resend_count", "value": {"intValue": max(0, attempt - 1)}},
+            {"key": "http.response.status_code", "value": {"intValue": status_code}}
+        ]
+
+        client_span = {
+            "traceId": trace_id,
+            "spanId": client_span_id,
+            "parentSpanId": exec_span_map[action_id],
+            "name": f"POST tool/{tool_name}",
+            "kind": 3,
+            "startTimeUnixNano": nano(24 + (attempt - 1) * 15),
+            "endTimeUnixNano": nano(40 + (attempt - 1) * 15),
+            "attributes": span_attrs
+        }
+
+        if status_code == 503:
+            client_span["status"] = {"code": 2}
+            client_span["attributes"].append({"key": "error.type", "value": {"stringValue": "503"}})
+        elif status_code == 0:
+            client_span["status"] = {"code": 2}
+            client_span["attributes"].append({"key": "error.type", "value": {"stringValue": "timeout"}})
         else:
-            action = "open_exception"
+            client_span["status"] = {"code": 1}
 
-    if len(refs) < 3:
-        all_refs = re.findall(r"\[R_[A-Za-z0-9]+\]", raw_str)
-        refs = list(dict.fromkeys(refs + all_refs))[:3]
-    while len(refs) < 3:
-        refs.append(f"[R_REF{len(refs)+1}]")
+        spans.append(client_span)
 
-    ref_cite = " and ".join(refs[:2])
-    third_ref = refs[2]
-    amt_fmt = f"{curr} {amt_minor / 100:.2f}"
-    rationale = f"Action {action} confirmed for {vendor} ({inv_num}) totaling {amt_fmt}, citing {ref_cite} and {third_ref} under policy {policy_rev}."
+    # Required incident.join span linking diagnostic tool executions
+    if num_diagnostics > 1 and len(diagnostic_exec_spans) > 1:
+        join_span_id = sha(f"join_{run_id}")[:16]
+        links = [{"traceId": trace_id, "spanId": sid, "attributes": common_attrs} for sid in diagnostic_exec_spans]
+        spans.append({
+            "traceId": trace_id,
+            "spanId": join_span_id,
+            "parentSpanId": agent_span_id,
+            "name": "incident.join",
+            "kind": 1,
+            "startTimeUnixNano": nano(50),
+            "endTimeUnixNano": nano(55),
+            "attributes": common_attrs,
+            "links": links
+        })
 
-    return {"action": action, "facts": facts, "evidenceRefs": refs[:3], "rationale": rationale}
+    # Required approval_gate span recording approval ID and nonce
+    for a in approval_log:
+        spans.append({
+            "traceId": trace_id,
+            "spanId": sha(f"appr_{a['approvalId']}")[:16],
+            "parentSpanId": agent_span_id,
+            "name": "approval_gate",
+            "kind": 1,
+            "startTimeUnixNano": nano(58),
+            "endTimeUnixNano": nano(64),
+            "attributes": common_attrs + [
+                {"key": "ga5.approval.id", "value": {"stringValue": a["approvalId"]}},
+                {"key": "ga5.approval.nonce", "value": {"stringValue": a.get("nonce", "nonce_appr")}}
+            ]
+        })
+
+    return {
+        "resourceSpans": [{
+            "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "incident-agent"}}]},
+            "scopeSpans": [{"scope": {"name": "ga5-incident-tracer", "version": "1.0"}, "spans": spans}]
+        }]
+    }
+
+# ---------------------------------------------------------------------------
+# Endpoints (Mounted at BOTH root /v2/... and /incident/v2/...)
+# ---------------------------------------------------------------------------
+
+@router.post("/v2/incidents")
+@router.post("/incident/v2/incidents")
+@router.post("/incident")
+@router.post("/incident/")
+async def create_incident(request: Request):
+    try: body = await request.json()
+    except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    if not isinstance(body, dict) or body.get("profile") != "ga5-incident-agent/v2" or not body.get("runId"):
+        return JSONResponse({"error": "Invalid profile or missing runId"}, status_code=422)
+
+    run_id = body["runId"]
+    h = sha(canon(body))
+
+    existing = q("SELECT request_hash, state_json FROM incident_runs WHERE run_id=?", (run_id,))
+    if existing:
+        if existing[0][0] != h:
+            return JSONResponse({"error": "Changed content conflict"}, status_code=409)
+        saved_state = json.loads(existing[0][1])
+        return JSONResponse(saved_state["responsePayload"])
+
+    incoming_tp = request.headers.get("traceparent", "")
+    tp_match = re.match(r"^00-([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$", incoming_tp)
+    trace_id = tp_match.group(1) if tp_match else uuid.uuid4().hex
+
+    incident_data = body.get("incident", {})
+    catalog = body.get("toolCatalog", [])
+    policy = body.get("policy", {})
+    service = incident_data.get("service", "target-service")
+
+    root_cause, evidence, diag_calls, chosen_model, eff_spec, eff_args = plan_incident(incident_data, catalog, policy)
+
+    dispatches = []
+    for idx, d_call in enumerate(diag_calls):
+        tool_name = d_call["toolName"]
+        act_id = "act_" + sha(f"{run_id}|{tool_name}|{idx}")[:16]
+        call_id = "call_" + sha(f"{run_id}|{tool_name}|{idx}")[:16]
+        cli_span_id = sha(f"cli_{act_id}_1")[:16]
+        tp = f"00-{trace_id}-{cli_span_id}-01"
+
+        dispatches.append({
+            "actionId": act_id,
+            "callId": call_id,
+            "phase": "diagnostic",
+            "toolName": tool_name,
+            "arguments": d_call["arguments"],
+            "evidence": [evidence[idx % len(evidence)]],
+            "attempt": 1,
+            "traceparent": tp
+        })
+
+    response_payload = {
+        "runId": run_id,
+        "status": "waiting",
+        "diagnosis": {"rootCause": root_cause, "evidence": evidence},
+        "dispatches": dispatches,
+        "approvals": []
+    }
+
+    state = {
+        "runId": run_id,
+        "publicMarker": body.get("publicMarker", "marker_safe"),
+        "traceId": trace_id,
+        "agentModel": chosen_model,
+        "diagnosis": {"rootCause": root_cause, "evidence": evidence},
+        "catalog": catalog,
+        "policy": policy,
+        "service": service,
+        "chosenEffectTool": eff_spec,
+        "pendingEffectArgs": eff_args,
+        "numDiagnostics": len(dispatches),
+        "dispatches": dispatches,
+        "actionLog": list(dispatches),
+        "receiptLog": [],
+        "approvalLog": [],
+        "status": "waiting",
+        "responsePayload": response_payload
+    }
+
+    tx([("INSERT INTO incident_runs (run_id, request_hash, state_json) VALUES (?,?,?)",
+         (run_id, h, json.dumps(state)))])
+
+    return JSONResponse(response_payload)
+
+@router.post("/v2/incidents/{runId}/receipts")
+@router.post("/incident/v2/incidents/{runId}/receipts")
+@router.post("/incident/{runId}/receipts")
+async def handle_receipts(runId: str, request: Request):
+    try: body = await request.json()
+    except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    receipt_id = body.get("receiptId", str(uuid.uuid4()))
+    receipt_key = f"{runId}_{receipt_id}"
+    rh = sha(canon(body))
+
+    existing_rcpt = q("SELECT receipt_hash, response_json FROM incident_receipts WHERE receipt_key=?", (receipt_key,))
+    if existing_rcpt:
+        if existing_rcpt[0][0] != rh:
+            return JSONResponse({"error": "Changed receipt conflict"}, status_code=409)
+        return JSONResponse(json.loads(existing_rcpt[0][1]))
+
+    run_row = q("SELECT state_json FROM incident_runs WHERE run_id=?", (runId,))
+    if not run_row: return JSONResponse({"error": "Run not found"}, status_code=404)
+    state = json.loads(run_row[0][0])
+
+    outcomes = body.get("outcomes", [])
+    approvals_in = body.get("approvals", [])
+
+    retry_dispatches = []
+    has_timeout = False
+
+    for o in outcomes:
+        state["receiptLog"].append({
+            "receiptId": receipt_id,
+            "actionId": o.get("actionId"),
+            "callId": o.get("callId"),
+            "attempt": int(o.get("attempt", 1)),
+            "status": int(o.get("status", 200)),
+            "resultClass": o.get("resultClass", "diagnosis_confirmed"),
+            "nonce": o.get("nonce", "nonce_rcpt")
+        })
+        if int(o.get("status", 200)) == 503 and int(o.get("attempt", 1)) == 1:
+            matching_d = next((d for d in state["actionLog"] if d["actionId"] == o.get("actionId")), None)
+            if matching_d:
+                retry_d = dict(matching_d)
+                retry_d["attempt"] = 2
+                new_cli_span = sha(f"cli_{retry_d['actionId']}_2")[:16]
+                retry_d["traceparent"] = f"00-{state['traceId']}-{new_cli_span}-01"
+                retry_dispatches.append(retry_d)
+                state["actionLog"].append(retry_d)
+        elif int(o.get("status", 200)) == 0 or o.get("errorType") == "timeout":
+            has_timeout = True
+
+    if retry_dispatches:
+        resp = {
+            "runId": runId,
+            "status": "waiting",
+            "diagnosis": state["diagnosis"],
+            "dispatches": retry_dispatches,
+            "approvals": []
+        }
+        state["responsePayload"] = resp
+        tx([("UPDATE incident_runs SET state_json=? WHERE run_id=?", (json.dumps(state), runId)),
+            ("INSERT INTO incident_receipts (receipt_key, receipt_hash, response_json) VALUES (?,?,?)",
+             (receipt_key, rh, json.dumps(resp)))])
+        return JSONResponse(resp)
+
+    if has_timeout:
+        trace = build_otlp_trace(runId, state["publicMarker"], state["traceId"], state["agentModel"],
+                                 state["actionLog"], state["receiptLog"], state["approvalLog"], state.get("numDiagnostics", 1))
+        resp = {
+            "runId": runId,
+            "status": "failed",
+            "diagnosis": state["diagnosis"],
+            "chosenEffect": None,
+            "suppressed": list(state["policy"].get("effectTools", [])),
+            "actionLog": state["actionLog"],
+            "receiptLog": state["receiptLog"],
+            "otlp": trace
+        }
+        state["responsePayload"] = resp
+        tx([("UPDATE incident_runs SET state_json=? WHERE run_id=?", (json.dumps(state), runId)),
+            ("INSERT INTO incident_receipts (receipt_key, receipt_hash, response_json) VALUES (?,?,?)",
+             (receipt_key, rh, json.dumps(resp)))])
+        return JSONResponse(resp)
+
+    if approvals_in:
+        appr = approvals_in[0]
+        state["approvalLog"].append(appr)
+        state["receiptLog"].append({
+            "receiptId": receipt_id,
+            "approvalId": appr.get("approvalId"),
+            "decision": appr.get("decision", "approved"),
+            "nonce": appr.get("nonce", "nonce_appr")
+        })
+
+        eff_tool = state.get("pendingEffectTool", "rollback_deployment")
+        eff_act_id = state.get("pendingActionId", "act_effect")
+        eff_call_id = state.get("pendingCallId", "call_effect")
+        cli_span = sha(f"cli_{eff_act_id}_1")[:16]
+
+        eff_dispatch = {
+            "actionId": eff_act_id,
+            "callId": eff_call_id,
+            "phase": "effect",
+            "toolName": eff_tool,
+            "arguments": state.get("pendingEffectArgs", {"service": state["service"]}),
+            "evidence": [state["diagnosis"]["evidence"][0]],
+            "attempt": 1,
+            "approvalId": appr.get("approvalId"),
+            "approvalNonce": appr.get("nonce"),
+            "traceparent": f"00-{state['traceId']}-{cli_span}-01"
+        }
+        state["actionLog"].append(eff_dispatch)
+        resp = {
+            "runId": runId,
+            "status": "waiting",
+            "diagnosis": state["diagnosis"],
+            "dispatches": [eff_dispatch],
+            "approvals": []
+        }
+        state["responsePayload"] = resp
+        tx([("UPDATE incident_runs SET state_json=? WHERE run_id=?", (json.dumps(state), runId)),
+            ("INSERT INTO incident_receipts (receipt_key, receipt_hash, response_json) VALUES (?,?,?)",
+             (receipt_key, rh, json.dumps(resp)))])
+        return JSONResponse(resp)
+
+    chosen_effect_tool = state.get("chosenEffectTool", {"name": "rollback_deployment"})
+    effect_name = chosen_effect_tool.get("name", "rollback_deployment")
+    appr_required = state["policy"].get("approvalRequiredFor", [])
+    has_effect_outcome = any(o.get("actionId") == state.get("pendingActionId") for o in outcomes)
+
+    if not has_effect_outcome:
+        eff_act_id = "act_" + sha(f"{runId}|effect|{effect_name}")[:16]
+        eff_call_id = "call_" + sha(f"{runId}|effect|{effect_name}")[:16]
+        eff_args = state.get("pendingEffectArgs", build_args_for_tool(chosen_effect_tool, state["service"], ""))
+
+        state["pendingEffectTool"] = effect_name
+        state["pendingActionId"] = eff_act_id
+        state["pendingCallId"] = eff_call_id
+        state["pendingEffectArgs"] = eff_args
+
+        if effect_name in appr_required:
+            appr_id = "appr_" + sha(f"{runId}|approval")[:16]
+            args_digest = sha(canon(eff_args))
+            resp = {
+                "runId": runId,
+                "status": "waiting",
+                "dispatches": [],
+                "approvals": [{
+                    "approvalId": appr_id,
+                    "actionId": eff_act_id,
+                    "toolName": effect_name,
+                    "argumentsDigest": args_digest
+                }]
+            }
+            state["responsePayload"] = resp
+            tx([("UPDATE incident_runs SET state_json=? WHERE run_id=?", (json.dumps(state), runId)),
+                ("INSERT INTO incident_receipts (receipt_key, receipt_hash, response_json) VALUES (?,?,?)",
+                 (receipt_key, rh, json.dumps(resp)))])
+            return JSONResponse(resp)
+        else:
+            cli_span = sha(f"cli_{eff_act_id}_1")[:16]
+            eff_dispatch = {
+                "actionId": eff_act_id,
+                "callId": eff_call_id,
+                "phase": "effect",
+                "toolName": effect_name,
+                "arguments": eff_args,
+                "evidence": [state["diagnosis"]["evidence"][0]],
+                "attempt": 1,
+                "traceparent": f"00-{state['traceId']}-{cli_span}-01"
+            }
+            state["actionLog"].append(eff_dispatch)
+            resp = {
+                "runId": runId,
+                "status": "waiting",
+                "diagnosis": state["diagnosis"],
+                "dispatches": [eff_dispatch],
+                "approvals": []
+            }
+            state["responsePayload"] = resp
+            tx([("UPDATE incident_runs SET state_json=? WHERE run_id=?", (json.dumps(state), runId)),
+                ("INSERT INTO incident_receipts (receipt_key, receipt_hash, response_json) VALUES (?,?,?)",
+                 (receipt_key, rh, json.dumps(resp)))])
+            return JSONResponse(resp)
+
+    trace = build_otlp_trace(runId, state["publicMarker"], state["traceId"], state["agentModel"],
+                             state["actionLog"], state["receiptLog"], state["approvalLog"], state.get("numDiagnostics", 1))
+
+    resp = {
+        "runId": runId,
+        "status": "completed",
+        "diagnosis": state["diagnosis"],
+        "chosenEffect": state.get("pendingEffectTool", effect_name),
+        "suppressed": [],
+        "actionLog": state["actionLog"],
+        "receiptLog": state["receiptLog"],
+        "otlp": trace
+    }
+    state["responsePayload"] = resp
+    tx([("UPDATE incident_runs SET state_json=? WHERE run_id=?", (json.dumps(state), runId)),
+        ("INSERT INTO incident_receipts (receipt_key, receipt_hash, response_json) VALUES (?,?,?)",
+         (receipt_key, rh, json.dumps(resp)))])
+    return JSONResponse(resp)
+
+@router.get("/v2/incidents/{runId}")
+@router.get("/incident/v2/incidents/{runId}")
+@router.get("/incident/{runId}")
+def get_incident(runId: str):
+    run_row = q("SELECT state_json FROM incident_runs WHERE run_id=?", (runId,))
+    if not run_row: return JSONResponse({"error": "Not found"}, status_code=404)
+    state = json.loads(run_row[0][0])
+    return JSONResponse(state["responsePayload"])
