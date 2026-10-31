@@ -8,6 +8,7 @@ router = APIRouter()
 
 LLM_URL = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
 LLM_KEY = os.environ.get("LLM_KEY", os.environ.get("GEMINI_API_KEY", "")).strip()
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
 
 def sha(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -56,12 +57,12 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
             m = re.match(r"^\[([A-Za-z0-9_\-.:#]+)\]\s*(.*)", line.strip())
             if m: clean_ev.append((m.group(1).strip(), m.group(2).strip()))
 
-    chosen_model = "gemini-2.5-flash"
+    chosen_model = LLM_MODEL
 
-    # Fast AI Planning Call if key exists
+    # Fast AI Call on compact evidence
     if LLM_KEY and clean_ev:
-        candidate_models = [os.environ.get("LLM_MODEL", "").strip(), "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-        candidate_models = [m for m in candidate_models if m]
+        candidate_models = [LLM_MODEL, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        candidate_models = list(dict.fromkeys([m for m in candidate_models if m]))
 
         prompt_payload = {
             "service": service,
@@ -102,7 +103,7 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
             except Exception:
                 continue
 
-    # High-Precision Fallback
+    # Deterministic Real-ID Fallback
     best_root = allowed_roots[0] if allowed_roots else "service_failure"
     best_score = -1
     matched_evs = []
@@ -297,7 +298,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
 
         spans.append(client_span)
 
-    # incident.join span linking diagnostic tool executions
+    # Required incident.join span linking diagnostic tool executions
     if num_diagnostics > 1 and len(diagnostic_exec_spans) > 1:
         join_span_id = sha(f"join_{run_id}")[:16]
         links = [{"traceId": trace_id, "spanId": sid, "attributes": common_attrs} for sid in diagnostic_exec_spans]
@@ -313,7 +314,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "links": links
         })
 
-    # approval_gate span recording approval ID and nonce
+    # Required approval_gate span recording approval ID and nonce
     for a in approval_log:
         spans.append({
             "traceId": trace_id,
@@ -335,6 +336,10 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "scopeSpans": [{"scope": {"name": "ga5-incident-tracer", "version": "1.0"}, "spans": spans}]
         }]
     }
+
+# ---------------------------------------------------------------------------
+# Endpoints (Mounted at BOTH root /v2/... and /incident/v2/...)
+# ---------------------------------------------------------------------------
 
 @router.post("/v2/incidents")
 @router.post("/incident/v2/incidents")
