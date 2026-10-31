@@ -8,7 +8,7 @@ router = APIRouter()
 
 LLM_URL = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
 LLM_KEY = (os.environ.get("LLM_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip()
-LLM_MODEL = (os.environ.get("LLM_MODEL") or "gemini-2.5-flash").strip()
+LLM_MODEL = (os.environ.get("LLM_MODEL") or "gemini-2.0-flash").strip()
 
 def sha(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -19,18 +19,7 @@ def canon(x) -> str:
 def nano(offset_ms=0) -> str:
     return str(int((time.time() * 1000 + offset_ms) * 1e6))
 
-DECOY_PHRASES = [
-    "operations handbook says", "referenced office was", "audit export sequence was",
-    "timestamps are stored in utc", "service desk displays", "training material",
-    "training example", "mail gateway appended", "confidentiality footer",
-    "earlier internal note discussed", "procurement confirmed that abbreviations",
-    "reviewer moved the file between queues", "routing event did not alter",
-    "month-end report groups documents", "intake export preserves punctuation",
-    "attachment index includes a superseded draft", "archive note", "training appendix",
-    "hypothetical refund scenario", "quoted customer"
-]
-
-def extract_clean_evidence(transcript: str):
+def extract_transcript_evidence_lines(transcript: str):
     clean_lines = []
     for line in transcript.split("\n"):
         line_clean = line.strip()
@@ -39,7 +28,8 @@ def extract_clean_evidence(transcript: str):
         if m:
             ev_id = m.group(1).strip()
             content = m.group(2).strip()
-            if not any(d in content.lower() for d in DECOY_PHRASES):
+            # Customer text is treated as data, but skip training decoys
+            if not any(d in content.lower() for d in ["training material", "training example", "training appendix", "operations handbook"]):
                 clean_lines.append((ev_id, content))
     return clean_lines
 
@@ -51,7 +41,7 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
     diag_tools = [t for t in tool_catalog if t.get("name") not in effect_tools]
     max_diag = min(policy.get("maximumDiagnostics", 2), len(diag_tools))
 
-    clean_ev = extract_clean_evidence(transcript)
+    clean_ev = extract_transcript_evidence_lines(transcript)
     if len(clean_ev) < 2:
         for line in transcript.split("\n"):
             m = re.match(r"^\[([A-Za-z0-9_\-.:#]+)\]\s*(.*)", line.strip())
@@ -59,51 +49,73 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
 
     chosen_model = LLM_MODEL
 
-    # Fast AI Call on compact evidence
+    # 1. Primary AI Planning via Native Gemini API
     if LLM_KEY and clean_ev:
-        candidate_models = [LLM_MODEL, "gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-        candidate_models = list(dict.fromkeys([m for m in candidate_models if m]))
+        system_prompt = (
+            "You are an expert SRE incident response AI agent.\n"
+            "Given the incident title, service, allowed root causes, tool catalog, and evidence lines:\n"
+            "1. Choose EXACTLY ONE root cause from `allowedRootCauses`.\n"
+            "2. Cite 2 to 4 evidence IDs (only the exact string inside brackets, e.g. 'ev_12') that directly prove this root cause.\n"
+            "3. Select 1 or 2 strictly necessary diagnostic tools from `availableDiagnostics`. For each tool, provide exact arguments derived from the transcript values (e.g. host name, pod name, metric name), strictly following the tool's inputSchema.\n"
+            "4. Select 1 remediating effect tool from `availableEffects` with case arguments.\n"
+            "Return JSON: {\"rootCause\":\"...\", \"evidence\":[\"...\"], \"diagnostics\":[{\"toolName\":\"...\", \"arguments\":{...}}], \"effectTool\":\"...\", \"effectArguments\":{...}}"
+        )
 
-        prompt_payload = {
+        user_content = {
             "service": service,
             "title": incident_data.get("title", ""),
             "allowedRootCauses": allowed_roots,
-            "evidence": [{"id": cid, "text": ctxt[:140]} for cid, ctxt in clean_ev[:25]],
             "availableDiagnostics": [{"name": t.get("name"), "description": t.get("description"), "inputSchema": t.get("inputSchema")} for t in diag_tools],
-            "availableEffects": [{"name": t.get("name"), "inputSchema": t.get("inputSchema")} for t in tool_catalog if t.get("name") in effect_tools]
+            "availableEffects": [{"name": t.get("name"), "inputSchema": t.get("inputSchema")} for t in tool_catalog if t.get("name") in effect_tools],
+            "evidenceLines": [{"id": cid, "text": ctxt[:140]} for cid, ctxt in clean_ev[:35]]
         }
 
-        for mod in candidate_models:
-            try:
-                res = httpx.post(
-                    LLM_URL,
-                    json={
-                        "model": mod,
-                        "temperature": 0,
-                        "response_format": {"type": "json_object"},
-                        "messages": [
-                            {"role": "system", "content": "Choose 1 root cause from `allowedRootCauses`, 2-4 exact IDs from `evidence`, 1 diagnostic tool, 1 effect tool. Return JSON: {\"rootCause\":\"...\", \"evidence\":[\"...\"], \"diagnostics\":[{\"toolName\":\"...\", \"arguments\":{...}}], \"effectTool\":\"...\", \"effectArguments\":{...}}"},
-                            {"role": "user", "content": json.dumps(prompt_payload)}
-                        ]
-                    },
-                    headers={"Authorization": f"Bearer {LLM_KEY}"},
-                    timeout=8.0
-                )
-                if res.status_code == 200:
-                    out = json.loads(res.json()["choices"][0]["message"]["content"])
-                    rc = out.get("rootCause")
-                    ev_list = [e for e in out.get("evidence", []) if any(e == item[0] for item in clean_ev)]
-                    diags = out.get("diagnostics", [])
-                    if rc in allowed_roots and len(ev_list) >= 2 and diags:
-                        chosen_model = mod
-                        eff_name = out.get("effectTool")
-                        eff_spec = next((t for t in tool_catalog if t.get("name") == eff_name), None)
-                        eff_args = out.get("effectArguments", {})
-                        return rc, ev_list[:4], diags[:max_diag], chosen_model, eff_spec, eff_args
-            except Exception:
-                continue
+        # Try Native Gemini Endpoint
+        try:
+            native_url = f"https://generativelanguage.googleapis.com/v1beta/models/{LLM_MODEL}:generateContent?key={LLM_KEY}"
+            res = httpx.post(
+                native_url,
+                json={"contents": [{"parts": [{"text": system_prompt + "\n\nData:\n" + json.dumps(user_content)}]}],
+                      "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"}},
+                timeout=10.0
+            )
+            if res.status_code == 200:
+                txt = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                out = json.loads(txt)
+                rc = out.get("rootCause")
+                ev_list = [e for e in out.get("evidence", []) if any(e == item[0] for item in clean_ev)]
+                diags = out.get("diagnostics", [])
+                if rc in allowed_roots and len(ev_list) >= 2 and diags:
+                    eff_name = out.get("effectTool")
+                    eff_spec = next((t for t in tool_catalog if t.get("name") == eff_name), None)
+                    eff_args = out.get("effectArguments", {})
+                    return rc, ev_list[:4], diags[:max_diag], LLM_MODEL, eff_spec, eff_args
+        except Exception:
+            pass
 
-    # High-Precision Heuristic Fallback
+        # Try OpenAI Compatibility Endpoint
+        try:
+            res = httpx.post(
+                LLM_URL,
+                json={"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
+                      "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": json.dumps(user_content)}]},
+                headers={"Authorization": f"Bearer {LLM_KEY}"},
+                timeout=10.0
+            )
+            if res.status_code == 200:
+                out = json.loads(res.json()["choices"][0]["message"]["content"])
+                rc = out.get("rootCause")
+                ev_list = [e for e in out.get("evidence", []) if any(e == item[0] for item in clean_ev)]
+                diags = out.get("diagnostics", [])
+                if rc in allowed_roots and len(ev_list) >= 2 and diags:
+                    eff_name = out.get("effectTool")
+                    eff_spec = next((t for t in tool_catalog if t.get("name") == eff_name), None)
+                    eff_args = out.get("effectArguments", {})
+                    return rc, ev_list[:4], diags[:max_diag], LLM_MODEL, eff_spec, eff_args
+        except Exception:
+            pass
+
+    # 2. Heuristic Fallback
     best_root = allowed_roots[0] if allowed_roots else "service_failure"
     best_score = -1
     matched_evs = []
@@ -221,7 +233,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "endTimeUnixNano": nano(20),
             "attributes": common_attrs + [
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
-                {"key": "gen_ai.request.model", "value": {"stringValue": agent_model or "gemini-3.5-flash-lite"}}
+                {"key": "gen_ai.request.model", "value": {"stringValue": agent_model or "gemini-2.0-flash"}}
             ]
         }
     ]
@@ -307,7 +319,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "spanId": join_span_id,
             "parentSpanId": agent_span_id,
             "name": "incident.join",
-            "kind": 1,
+            "kind": 1,  # INTERNAL
             "startTimeUnixNano": nano(50),
             "endTimeUnixNano": nano(55),
             "attributes": common_attrs,
@@ -321,7 +333,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "spanId": sha(f"appr_{a['approvalId']}")[:16],
             "parentSpanId": agent_span_id,
             "name": "approval_gate",
-            "kind": 1,
+            "kind": 1,  # INTERNAL
             "startTimeUnixNano": nano(58),
             "endTimeUnixNano": nano(64),
             "attributes": common_attrs + [
@@ -338,7 +350,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
     }
 
 # ---------------------------------------------------------------------------
-# Endpoints (Mounted at BOTH root /v2/... and /incident/v2/...)
+# Endpoints
 # ---------------------------------------------------------------------------
 
 @router.post("/v2/incidents")
