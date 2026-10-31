@@ -42,15 +42,15 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
     all_ev = extract_all_evidence_lines(transcript)
     chosen_model = LLM_MODEL
 
-    # 1. Fast AI Planning call on the complete transcript
+    # 1. AI Planning Call across the full transcript
     if LLM_KEY and all_ev:
         system_prompt = (
             "You are an SRE incident response AI.\n"
             "Given the incident title, target service, allowedRootCauses, tool catalog, and evidence lines:\n"
             "1. Choose EXACTLY ONE root cause from `allowedRootCauses`.\n"
-            "2. Cite between 2 and 4 evidence IDs from `evidenceLines` (string only, no brackets) that justify this root cause.\n"
-            "3. Select 1 or 2 strictly necessary diagnostic tools from `availableDiagnostics`. Provide exact case-derived arguments from the evidence (e.g. host name, cluster, pod, metric), adhering to the tool's inputSchema.\n"
-            "4. Choose 1 remediating effect tool from `availableEffects` with arguments.\n"
+            "2. Cite between 2 and 4 evidence IDs from `evidenceLines` (string only, no brackets) that prove this root cause.\n"
+            "3. Select 1 or 2 strictly necessary diagnostic tools from `availableDiagnostics`. Provide exact case-derived arguments from the evidence, strictly following the tool's inputSchema.\n"
+            "4. Choose 1 remediating effect tool from `availableEffects` with case arguments.\n"
             "Return JSON: {\"rootCause\":\"...\", \"evidence\":[\"...\"], \"diagnostics\":[{\"toolName\":\"...\", \"arguments\":{...}}], \"effectTool\":\"...\", \"effectArguments\":{...}}"
         )
 
@@ -63,7 +63,6 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
             "evidenceLines": [{"id": cid, "text": ctxt[:180]} for cid, ctxt in all_ev]
         }
 
-        # Try Native Gemini endpoint first
         try:
             native_url = f"https://generativelanguage.googleapis.com/v1beta/models/{LLM_MODEL}:generateContent?key={LLM_KEY}"
             res = httpx.post(
@@ -87,7 +86,6 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
         except Exception:
             pass
 
-        # Try OpenAI-compatible endpoint
         try:
             res = httpx.post(
                 LLM_URL,
@@ -110,7 +108,7 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
         except Exception:
             pass
 
-    # 2. Comprehensive Transcript Scoring Fallback
+    # 2. Comprehensive Deterministic Fallback
     best_root = allowed_roots[0] if allowed_roots else "service_failure"
     best_score = -1
     best_matched_evs = []
@@ -142,7 +140,7 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
 
     chosen_evidence = best_matched_evs[:3]
 
-    # Select the diagnostic tool best matching the chosen root cause
+    # Score diagnostic tools against the root cause
     root_tokens = set(re.split(r"[_\s\-]+", best_root.lower()))
     def score_tool(t):
         return sum(1 for tok in root_tokens if tok in (t.get("name", "") + " " + t.get("description", "")).lower())
@@ -174,34 +172,54 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
 def build_args_for_tool(tool: dict, service: str, transcript: str) -> dict:
     schema = tool.get("inputSchema", {})
     props = schema.get("properties", {})
+    required = set(schema.get("required", []))
     args = {}
 
     for p_name, p_spec in props.items():
         low = p_name.lower()
-        p_type = p_spec.get("type", "string")
+        enums = p_spec.get("enum", [])
 
-        if "service" in low: args[p_name] = service
+        if enums:
+            matched_enum = next((e for e in enums if str(e).lower() in transcript.lower()), enums[0])
+            args[p_name] = matched_enum
+            continue
+
+        if "service" in low or "app" in low:
+            args[p_name] = service
+        elif "pod" in low or "container" in low:
+            pod_match = re.search(rf"\b({service}-[a-z0-9]+-[a-z0-9]+)\b", transcript, re.I)
+            if not pod_match:
+                pod_match = re.search(r"\b([a-z0-9\-]+-[a-z0-9]{4,10}-[a-z0-9]{4,6})\b", transcript, re.I)
+            if pod_match:
+                args[p_name] = pod_match.group(1)
+            elif p_name in required:
+                args[p_name] = f"{service}-pod-01"
+        elif "host" in low or "node" in low:
+            node_match = re.search(r"\b(node-[a-z0-9\-]+|host-[a-z0-9\-]+|worker-[a-z0-9\-]+)\b", transcript, re.I)
+            if node_match:
+                args[p_name] = node_match.group(1)
+            elif p_name in required:
+                args[p_name] = f"{service}-node-01"
         elif "region" in low:
-            m = re.search(r"\b(us-east-1|us-west-2|eu-west-1|ap-south-1)\b", transcript)
-            args[p_name] = m.group(1) if m else "us-east-1"
-        elif "host" in low or "node" in low or "instance" in low:
-            m = re.search(r"\b([a-z0-9\-]+(?:host|node|worker|prod|srv)[a-z0-9\-]*)\b", transcript, re.I)
-            args[p_name] = m.group(1) if m else f"{service}-worker-01"
-        elif "pod" in low:
-            m = re.search(rf"\b({service}-[a-z0-9]+-[a-z0-9]+)\b", transcript)
-            args[p_name] = m.group(1) if m else f"{service}-pod-01"
-        elif "metric" in low or "query" in low:
-            m = re.search(r"\b(cpu[_\w]*|memory[_\w]*|error_rate|latency|request_count|db_pool[_\w]*)\b", transcript, re.I)
-            args[p_name] = m.group(1) if m else "error_rate"
-        elif "cluster" in low: args[p_name] = f"{service}-prod"
-        elif "namespace" in low or "env" in low: args[p_name] = "production"
-        elif p_type == "integer": args[p_name] = int(p_spec.get("default", 10))
-        elif p_type == "boolean": args[p_name] = bool(p_spec.get("default", True))
-        elif p_type == "array": args[p_name] = [service]
-        elif "enum" in p_spec: args[p_name] = p_spec["enum"][0]
-        else:
-            m = re.search(r"\b([A-Za-z0-9_\-]{4,25})\b", transcript)
-            args[p_name] = m.group(1) if m else service
+            reg_match = re.search(r"\b(us-east-1|us-west-2|eu-west-1|ap-south-1|ap-southeast-1)\b", transcript)
+            args[p_name] = reg_match.group(1) if reg_match else "us-east-1"
+        elif "cluster" in low:
+            cluster_match = re.search(r"\b([a-z0-9\-]+-cluster|[a-z0-9\-]+-prod)\b", transcript)
+            args[p_name] = cluster_match.group(1) if cluster_match else f"{service}-prod"
+        elif "metric" in low:
+            metric_match = re.search(r"\b([a-z_]+(?:_rate|_count|_utilization|_latency|_bytes|_total))\b", transcript, re.I)
+            args[p_name] = metric_match.group(1) if metric_match else "cpu_utilization"
+        elif "query" in low or "filter" in low:
+            args[p_name] = f"service={service} level=error"
+        elif p_spec.get("type") == "integer":
+            args[p_name] = int(p_spec.get("default", 10))
+        elif p_spec.get("type") == "boolean":
+            args[p_name] = bool(p_spec.get("default", True))
+        elif p_spec.get("type") == "array":
+            args[p_name] = [service]
+        elif p_name in required:
+            args[p_name] = service
+
     return args
 
 def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, receipt_log, approval_log, num_diagnostics):
@@ -331,7 +349,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "spanId": join_span_id,
             "parentSpanId": agent_span_id,
             "name": "incident.join",
-            "kind": 1,
+            "kind": 1,  # INTERNAL
             "startTimeUnixNano": nano(50),
             "endTimeUnixNano": nano(55),
             "attributes": common_attrs,
@@ -345,7 +363,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "spanId": sha(f"appr_{a['approvalId']}")[:16],
             "parentSpanId": agent_span_id,
             "name": "approval_gate",
-            "kind": 1,
+            "kind": 1,  # INTERNAL
             "startTimeUnixNano": nano(58),
             "endTimeUnixNano": nano(64),
             "attributes": common_attrs + [
@@ -387,6 +405,7 @@ async def create_incident(request: Request):
         return JSONResponse(saved_state["responsePayload"])
 
     incoming_tp = request.headers.get("traceparent", "")
+    incoming_ts = request.headers.get("tracestate")
     tp_match = re.match(r"^00-([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$", incoming_tp)
     trace_id = tp_match.group(1) if tp_match else uuid.uuid4().hex
 
@@ -405,7 +424,7 @@ async def create_incident(request: Request):
         cli_span_id = sha(f"cli_{act_id}_1")[:16]
         tp = f"00-{trace_id}-{cli_span_id}-01"
 
-        dispatches.append({
+        disp = {
             "actionId": act_id,
             "callId": call_id,
             "phase": "diagnostic",
@@ -414,7 +433,10 @@ async def create_incident(request: Request):
             "evidence": [evidence[idx % len(evidence)]],
             "attempt": 1,
             "traceparent": tp
-        })
+        }
+        if incoming_ts:
+            disp["tracestate"] = incoming_ts
+        dispatches.append(disp)
 
     response_payload = {
         "runId": run_id,
@@ -428,6 +450,7 @@ async def create_incident(request: Request):
         "runId": run_id,
         "publicMarker": body.get("publicMarker", "marker_safe"),
         "traceId": trace_id,
+        "incomingTracestate": incoming_ts,
         "agentModel": chosen_model,
         "diagnosis": {"rootCause": root_cause, "evidence": evidence},
         "catalog": catalog,
@@ -493,6 +516,8 @@ async def handle_receipts(runId: str, request: Request):
                 retry_d["attempt"] = 2
                 new_cli_span = sha(f"cli_{retry_d['actionId']}_2")[:16]
                 retry_d["traceparent"] = f"00-{state['traceId']}-{new_cli_span}-01"
+                if state.get("incomingTracestate"):
+                    retry_d["tracestate"] = state["incomingTracestate"]
                 retry_dispatches.append(retry_d)
                 state["actionLog"].append(retry_d)
         elif int(o.get("status", 200)) == 0 or o.get("errorType") == "timeout":
@@ -560,6 +585,8 @@ async def handle_receipts(runId: str, request: Request):
             "approvalNonce": appr.get("nonce"),
             "traceparent": f"00-{state['traceId']}-{cli_span}-01"
         }
+        if state.get("incomingTracestate"):
+            eff_dispatch["tracestate"] = state["incomingTracestate"]
         state["actionLog"].append(eff_dispatch)
         resp = {
             "runId": runId,
@@ -620,6 +647,8 @@ async def handle_receipts(runId: str, request: Request):
                 "attempt": 1,
                 "traceparent": f"00-{state['traceId']}-{cli_span}-01"
             }
+            if state.get("incomingTracestate"):
+                eff_dispatch["tracestate"] = state["incomingTracestate"]
             state["actionLog"].append(eff_dispatch)
             resp = {
                 "runId": runId,
