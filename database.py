@@ -1,6 +1,6 @@
 import sqlite3, threading, json, os, time
 
-DB_FILE = os.environ.get("DB_PATH", "agents_v2.db")
+DB_FILE = os.environ.get("DB_PATH", "agents_v4.db")
 db_lock = threading.RLock()
 _locks, _master = {}, threading.Lock()
 
@@ -19,6 +19,7 @@ def get_db():
 conn = get_db()
 with db_lock:
     conn.executescript('''
+    -- Task 2: A2A Invoice Storage
     CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, principal TEXT, body TEXT);
     CREATE TABLE IF NOT EXISTS msgs (
         principal TEXT,
@@ -30,6 +31,17 @@ with db_lock:
     );
     CREATE TABLE IF NOT EXISTS cache (k TEXT PRIMARY KEY, v TEXT);
 
+    -- Task 3: Mailroom Storage
+    CREATE TABLE IF NOT EXISTS mailroom_evals (
+        eval_id TEXT PRIMARY KEY,
+        req_hash TEXT,
+        verifier_jwk TEXT,
+        input_digest TEXT,
+        proposals_json TEXT,
+        response_json TEXT
+    );
+
+    -- Task 4: Incident Triage Storage
     CREATE TABLE IF NOT EXISTS incident_runs (
         run_id TEXT PRIMARY KEY,
         request_hash TEXT,
@@ -40,20 +52,7 @@ with db_lock:
         receipt_hash TEXT,
         response_json TEXT
     );
-
-    CREATE TABLE IF NOT EXISTS mailroom_cases (
-        case_id TEXT PRIMARY KEY,
-        principal TEXT,
-        decision TEXT,
-        status TEXT,
-        receipt_token TEXT,
-        executed INTEGER DEFAULT 0
-    );
     ''')
-    try:
-        conn.execute("ALTER TABLE msgs ADD COLUMN created_at REAL")
-    except Exception:
-        pass
     conn.commit()
 
 def q(sql, args=()):
