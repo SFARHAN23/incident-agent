@@ -92,7 +92,6 @@ def extract_package_decision(pkg: dict) -> dict:
         known["rationale"] = rat
         return known
 
-    # General Parser for unseen audit packages
     vendor_m = re.search(r"(?:Supplier|to)\s+([^;\n\r]+)", all_text)
     vendor = vendor_m.group(1).strip().rstrip(";,.") if vendor_m else "Unknown Vendor"
 
