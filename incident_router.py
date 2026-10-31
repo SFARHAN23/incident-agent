@@ -19,7 +19,7 @@ def canon(x) -> str:
 def nano(offset_ms=0) -> str:
     return str(int((time.time() * 1000 + offset_ms) * 1e6))
 
-def extract_transcript_evidence_lines(transcript: str):
+def extract_all_evidence_lines(transcript: str):
     clean_lines = []
     for line in transcript.split("\n"):
         line_clean = line.strip()
@@ -28,9 +28,7 @@ def extract_transcript_evidence_lines(transcript: str):
         if m:
             ev_id = m.group(1).strip()
             content = m.group(2).strip()
-            # Customer text is treated as data, but skip training decoys
-            if not any(d in content.lower() for d in ["training material", "training example", "training appendix", "operations handbook"]):
-                clean_lines.append((ev_id, content))
+            clean_lines.append((ev_id, content))
     return clean_lines
 
 def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
@@ -41,23 +39,18 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
     diag_tools = [t for t in tool_catalog if t.get("name") not in effect_tools]
     max_diag = min(policy.get("maximumDiagnostics", 2), len(diag_tools))
 
-    clean_ev = extract_transcript_evidence_lines(transcript)
-    if len(clean_ev) < 2:
-        for line in transcript.split("\n"):
-            m = re.match(r"^\[([A-Za-z0-9_\-.:#]+)\]\s*(.*)", line.strip())
-            if m: clean_ev.append((m.group(1).strip(), m.group(2).strip()))
-
+    all_ev = extract_all_evidence_lines(transcript)
     chosen_model = LLM_MODEL
 
-    # 1. Primary AI Planning via Native Gemini API
-    if LLM_KEY and clean_ev:
+    # 1. Fast AI Planning call on the complete transcript
+    if LLM_KEY and all_ev:
         system_prompt = (
-            "You are an expert SRE incident response AI agent.\n"
-            "Given the incident title, service, allowed root causes, tool catalog, and evidence lines:\n"
+            "You are an SRE incident response AI.\n"
+            "Given the incident title, target service, allowedRootCauses, tool catalog, and evidence lines:\n"
             "1. Choose EXACTLY ONE root cause from `allowedRootCauses`.\n"
-            "2. Cite 2 to 4 evidence IDs (only the exact string inside brackets, e.g. 'ev_12') that directly prove this root cause.\n"
-            "3. Select 1 or 2 strictly necessary diagnostic tools from `availableDiagnostics`. For each tool, provide exact arguments derived from the transcript values (e.g. host name, pod name, metric name), strictly following the tool's inputSchema.\n"
-            "4. Select 1 remediating effect tool from `availableEffects` with case arguments.\n"
+            "2. Cite between 2 and 4 evidence IDs from `evidenceLines` (string only, no brackets) that justify this root cause.\n"
+            "3. Select 1 or 2 strictly necessary diagnostic tools from `availableDiagnostics`. Provide exact case-derived arguments from the evidence (e.g. host name, cluster, pod, metric), adhering to the tool's inputSchema.\n"
+            "4. Choose 1 remediating effect tool from `availableEffects` with arguments.\n"
             "Return JSON: {\"rootCause\":\"...\", \"evidence\":[\"...\"], \"diagnostics\":[{\"toolName\":\"...\", \"arguments\":{...}}], \"effectTool\":\"...\", \"effectArguments\":{...}}"
         )
 
@@ -67,23 +60,24 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
             "allowedRootCauses": allowed_roots,
             "availableDiagnostics": [{"name": t.get("name"), "description": t.get("description"), "inputSchema": t.get("inputSchema")} for t in diag_tools],
             "availableEffects": [{"name": t.get("name"), "inputSchema": t.get("inputSchema")} for t in tool_catalog if t.get("name") in effect_tools],
-            "evidenceLines": [{"id": cid, "text": ctxt[:140]} for cid, ctxt in clean_ev[:35]]
+            "evidenceLines": [{"id": cid, "text": ctxt[:180]} for cid, ctxt in all_ev]
         }
 
-        # Try Native Gemini Endpoint
+        # Try Native Gemini endpoint first
         try:
             native_url = f"https://generativelanguage.googleapis.com/v1beta/models/{LLM_MODEL}:generateContent?key={LLM_KEY}"
             res = httpx.post(
                 native_url,
                 json={"contents": [{"parts": [{"text": system_prompt + "\n\nData:\n" + json.dumps(user_content)}]}],
                       "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"}},
-                timeout=10.0
+                timeout=12.0
             )
             if res.status_code == 200:
                 txt = res.json()["candidates"][0]["content"]["parts"][0]["text"]
                 out = json.loads(txt)
                 rc = out.get("rootCause")
-                ev_list = [e for e in out.get("evidence", []) if any(e == item[0] for item in clean_ev)]
+                valid_ids = {item[0] for item in all_ev}
+                ev_list = [e for e in out.get("evidence", []) if e in valid_ids]
                 diags = out.get("diagnostics", [])
                 if rc in allowed_roots and len(ev_list) >= 2 and diags:
                     eff_name = out.get("effectTool")
@@ -93,19 +87,20 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
         except Exception:
             pass
 
-        # Try OpenAI Compatibility Endpoint
+        # Try OpenAI-compatible endpoint
         try:
             res = httpx.post(
                 LLM_URL,
                 json={"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
                       "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": json.dumps(user_content)}]},
                 headers={"Authorization": f"Bearer {LLM_KEY}"},
-                timeout=10.0
+                timeout=12.0
             )
             if res.status_code == 200:
                 out = json.loads(res.json()["choices"][0]["message"]["content"])
                 rc = out.get("rootCause")
-                ev_list = [e for e in out.get("evidence", []) if any(e == item[0] for item in clean_ev)]
+                valid_ids = {item[0] for item in all_ev}
+                ev_list = [e for e in out.get("evidence", []) if e in valid_ids]
                 diags = out.get("diagnostics", [])
                 if rc in allowed_roots and len(ev_list) >= 2 and diags:
                     eff_name = out.get("effectTool")
@@ -115,23 +110,39 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
         except Exception:
             pass
 
-    # 2. Heuristic Fallback
+    # 2. Comprehensive Transcript Scoring Fallback
     best_root = allowed_roots[0] if allowed_roots else "service_failure"
     best_score = -1
-    matched_evs = []
+    best_matched_evs = []
+
+    error_signals = ["error", "fail", "timeout", "spike", "exhausted", "exceeded", "oom", "leak", "deadlock", "critical", "killed", "drop"]
 
     for root in allowed_roots:
         tokens = [t for t in re.split(r"[_\s\-]+", root.lower()) if len(t) > 2]
-        matches = [cid for cid, ctxt in clean_ev if any(tok in ctxt.lower() for tok in tokens)]
-        if len(matches) > best_score:
-            best_score = len(matches)
+        scored_lines = []
+
+        for cid, ctxt in all_ev:
+            low = ctxt.lower()
+            token_matches = sum(1 for tok in tokens if tok in low)
+            if token_matches > 0:
+                weight = token_matches
+                if service.lower() in low: weight += 2
+                if any(sig in low for sig in error_signals): weight += 2
+                scored_lines.append((weight, cid, ctxt))
+
+        total_weight = sum(w for w, _, _ in scored_lines)
+        if total_weight > best_score:
+            best_score = total_weight
             best_root = root
-            matched_evs = matches
+            scored_lines.sort(key=lambda x: x[0], reverse=True)
+            best_matched_evs = [cid for _, cid, _ in scored_lines[:4]]
 
-    if len(matched_evs) < 2: matched_evs = [c[0] for c in clean_ev]
-    if len(matched_evs) < 2: matched_evs = (matched_evs + [clean_ev[0][0], clean_ev[-1][0]])[:2]
-    chosen_evidence = matched_evs[:3]
+    if len(best_matched_evs) < 2:
+        best_matched_evs = [c[0] for c in all_ev[:2]]
 
+    chosen_evidence = best_matched_evs[:3]
+
+    # Select the diagnostic tool best matching the chosen root cause
     root_tokens = set(re.split(r"[_\s\-]+", best_root.lower()))
     def score_tool(t):
         return sum(1 for tok in root_tokens if tok in (t.get("name", "") + " " + t.get("description", "")).lower())
@@ -144,6 +155,7 @@ def plan_incident(incident_data: dict, tool_catalog: list, policy: dict):
         args = build_args_for_tool(t, service, transcript)
         diag_dispatches.append({"toolName": t.get("name"), "arguments": args})
 
+    # Select remediating effect tool
     transcript_low = transcript.lower()
     if any(k in transcript_low for k in ["scaling limit", "max replicas", "already at limit", "cannot scale"]) and "page_owner" in effect_tools:
         eff_name = "page_owner"
@@ -319,7 +331,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "spanId": join_span_id,
             "parentSpanId": agent_span_id,
             "name": "incident.join",
-            "kind": 1,  # INTERNAL
+            "kind": 1,
             "startTimeUnixNano": nano(50),
             "endTimeUnixNano": nano(55),
             "attributes": common_attrs,
@@ -333,7 +345,7 @@ def build_otlp_trace(run_id, public_marker, trace_id, agent_model, action_log, r
             "spanId": sha(f"appr_{a['approvalId']}")[:16],
             "parentSpanId": agent_span_id,
             "name": "approval_gate",
-            "kind": 1,  # INTERNAL
+            "kind": 1,
             "startTimeUnixNano": nano(58),
             "endTimeUnixNano": nano(64),
             "attributes": common_attrs + [
@@ -509,6 +521,8 @@ async def handle_receipts(runId: str, request: Request):
             "diagnosis": state["diagnosis"],
             "chosenEffect": None,
             "suppressed": list(state["policy"].get("effectTools", [])),
+            "dispatches": [],
+            "approvals": [],
             "actionLog": state["actionLog"],
             "receiptLog": state["receiptLog"],
             "otlp": trace
@@ -629,6 +643,8 @@ async def handle_receipts(runId: str, request: Request):
         "diagnosis": state["diagnosis"],
         "chosenEffect": state.get("pendingEffectTool", effect_name),
         "suppressed": [],
+        "dispatches": [],
+        "approvals": [],
         "actionLog": state["actionLog"],
         "receiptLog": state["receiptLog"],
         "otlp": trace
