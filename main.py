@@ -1,7 +1,7 @@
 import os, json
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 import a2a_router, mailroom_router, incident_router
 
 app = FastAPI(title="Unified Agent Suite")
@@ -52,7 +52,7 @@ def agent_card(request: Request):
     }
     return Response(content=json.dumps(card_data, ensure_ascii=False), media_type="application/a2a+json")
 
-# Mount Routers
+# Mount Routers (Strict non-empty paths only)
 app.include_router(a2a_router.router, prefix="/a2a", tags=["Task 2: Invoice Agent"])
 app.include_router(mailroom_router.router, tags=["Task 3: Safe Mailroom"])
 app.include_router(incident_router.router, tags=["Task 4: Incident Triage"])
