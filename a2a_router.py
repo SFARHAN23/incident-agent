@@ -16,9 +16,9 @@ REC_MT = "application/vnd.ga5.invoice-action-receipts+json"
 IR, DONE, CANC = "TASK_STATE_INPUT_REQUIRED", "TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"
 
 def canon(x): return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-def sha(s): return hashlib.sha256(s.encode()).hexdigest()
+def sha(s): return hashlib.sha256(s.encode("utf-8")).hexdigest()
 def now(): return datetime.now(timezone.utc).isoformat()
-def reply(obj, status=200): return Response(json.dumps(obj, ensure_ascii=False).encode(), status_code=status, media_type=MT)
+def reply(obj, status=200): return Response(json.dumps(obj, ensure_ascii=False).encode("utf-8"), status_code=status, media_type=MT)
 def err(status, code): return reply({"error": {"code": code, "message": "Request could not be processed."}}, status)
 
 def gate(request: Request, need_json=False):
@@ -30,7 +30,7 @@ def gate(request: Request, need_json=False):
         return None, err(400, "VERSION_NOT_SUPPORTED")
     if need_json:
         ct = request.headers.get("content-type", "").lower()
-        if not (ct.startswith(MT) or ct.startswith("application/json")):
+        if not ct.startswith("application/a2a+json"):
             return None, err(415, "UNSUPPORTED_MEDIA_TYPE")
     return sha(tok)[:32], None
 
@@ -83,7 +83,6 @@ def handle_send_sync(p, body):
         if rows:
             prev_hash, task_id = rows[0][0], rows[0][1]
             created_at = rows[0][2] if len(rows[0]) > 2 and rows[0][2] is not None else time.time()
-            # If entry is older than 180s, it belongs to a past battery run; evict and proceed cleanly
             if time.time() - created_at < 180:
                 if prev_hash != h:
                     return err(409, "IDEMPOTENCY_CONFLICT")
